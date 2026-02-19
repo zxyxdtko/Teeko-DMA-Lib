@@ -7,8 +7,8 @@
 
 #include <chrono>
 
-#pragma comment(lib, "libs/vmm.lib")
-#pragma comment(lib, "libs/leechcore.lib")
+#pragma comment(lib, "vmm.lib")
+#pragma comment(lib, "leechcore.lib")
 
 struct HeapRegion {
   uint64_t start;
@@ -145,7 +145,7 @@ public:
     /// </summary>
     /// <returns>True if initialization was successful, false otherwise.</returns>
     inline bool Initialize() {
-        const char* args[] = { "", "-printf", "-device", "fpga" };
+        const char* args[] = { "", /*"-printf",*/ "-device", "fpga" };
         int argc = sizeof(args) / sizeof(args[0]);
         hVMM = VMMDLL_Initialize(argc, (LPCSTR*)args);
         return hVMM != nullptr;
