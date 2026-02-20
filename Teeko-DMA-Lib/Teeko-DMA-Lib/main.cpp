@@ -13,7 +13,7 @@ auto main() -> int
 
     if (!g_Dma.Attach("svchost.exe"))
     {
-        std::cout << "[-] Failed to attach to destiny2.exe" << std::endl;
+        std::cout << "[-] Failed to attach to svchost.exe" << std::endl;
         system("pause");
         return -2;
     }
