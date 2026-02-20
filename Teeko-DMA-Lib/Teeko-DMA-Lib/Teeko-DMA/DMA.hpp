@@ -687,15 +687,18 @@ public:
     /// Dumps a module from memory to disk, fixing Section Headers and IAT.
     /// Useful for unpacking and static analysis.
     /// </summary>
-    inline bool DumpModule(const std::string& moduleName,
-        const std::string& outPath) {
+    /// <summary>
+    /// Dumps a module from memory to disk using a Linear Dump strategy.
+    /// This maps the file 1:1 with memory (Virtual Address == Raw Offset), which determines the best layout for packed/obfuscated files.
+    /// </summary>
+    inline bool DumpModule(const std::string& moduleName, const std::string& outPath) {
         uint64_t modBase = GetModuleBase(moduleName);
         uint32_t modSize = GetModuleSize(moduleName);
-
         if (modBase == 0 || modSize == 0)
             return false;
 
-        // 1. Pull the raw, unpacked module from live memory
+        // 1. Pull the complete module from memory
+        // We use the full module size to ensure we get everything including the headers and all sections
         std::vector<uint8_t> buffer = DumpMemory(modBase, modSize);
         if (buffer.empty() || buffer.size() < sizeof(IMAGE_DOS_HEADER))
             return false;
@@ -704,79 +707,85 @@ public:
         if (pDos->e_magic != IMAGE_DOS_SIGNATURE)
             return false;
 
-        PIMAGE_NT_HEADERS64 pNt =
-            (PIMAGE_NT_HEADERS64)(buffer.data() + pDos->e_lfanew);
+        PIMAGE_NT_HEADERS64 pNt = (PIMAGE_NT_HEADERS64)(buffer.data() + pDos->e_lfanew);
         if (pNt->Signature != IMAGE_NT_SIGNATURE)
             return false;
 
-        bool is32Bit = (pNt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
+        // We are creating a "Linear Dump" / "Virtual Dump".
+        // In this format, the file on disk is identical to the image in memory.
+        // Raw Offset == Virtual Address.
+        // This defeats packers that manipulate section headers to alias raw offsets to 
+        // completely different parts of the file than where they end up in memory.
 
-        // 2. Fix the Section Headers (Memory Alignment -> File Alignment)
+        bool is32Bit = (pNt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
         WORD numSections = pNt->FileHeader.NumberOfSections;
         PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
 
+        // Force section alignment to match file alignment (usually page size 0x1000)
+        // This tells tools that the file is effectively "flat"
+        pNt->OptionalHeader.FileAlignment = pNt->OptionalHeader.SectionAlignment;
+        
+        // Fix section headers to point effectively to themselves
         for (WORD i = 0; i < numSections; i++) {
-            // Because we dumped it exactly as it was mapped in memory,
-            // the raw offsets must now match the virtual RVAs.
-            pSection[i].SizeOfRawData = pSection[i].Misc.VirtualSize;
+            // Point the raw data to the virtual address.
+            // In a linear dump, the data exists in the file at the exact same offset as its RVA.
             pSection[i].PointerToRawData = pSection[i].VirtualAddress;
+            
+            // Ensure the size is aligned and valid
+            pSection[i].SizeOfRawData = pSection[i].Misc.VirtualSize;
         }
 
-        // 3. Rebuild the Import Address Table (IAT)
-        PVMMDLL_MAP_IAT pIatMap = nullptr;
+        // Fix IAT if possible (Import Address Table)
+        // Many packers will destroy the IAT or redirect it. VMMDLL can help us reconstruct it.
+        
+        // Zero bound imports directory as it is invalid in a dump
+        if(pNt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT) {
+             pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
+             pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
+        }
 
-        // Let vmmdll do the heavy lifting of parsing the target's imports
-        if (VMMDLL_Map_GetIATU(hVMM, targetPID, moduleName.c_str(), &pIatMap) &&
-            pIatMap) {
+        // Zero IAT directory to force regeneration by analysis tools, or we can try to fix it.
+        // For a raw dump, often better to clear it if we can't fully rebuild it, but we will try to patch what we can.
+        
+        // Attempt to fix imports using VMMDLL's analysis
+        PVMMDLL_MAP_IAT pIatMap = nullptr;
+        if (VMMDLL_Map_GetIATU(hVMM, targetPID, moduleName.c_str(), &pIatMap) && pIatMap) {
             for (DWORD i = 0; i < pIatMap->cMap; i++) {
                 const auto& entry = pIatMap->pMap[i];
+                if (entry.Thunk.rvaFirstThunk == 0)
+                    continue;
+                
+                // Ensure we are within bounds of our dump
+                if ((entry.Thunk.rvaFirstThunk + (is32Bit ? 4 : 8)) > buffer.size())
+                    continue;
 
-                // Ensure the thunk RVA is actually within our dumped memory range
-                if (entry.Thunk.rvaFirstThunk != 0 &&
-                    (entry.Thunk.rvaFirstThunk + 8) <= buffer.size()) {
-
-                    // If this is a named import (e.g., "VirtualAlloc"), restore its RVA
-                    if (entry.Thunk.rvaNameFunction != 0) {
-                        if (is32Bit) {
-                            uint32_t* pThunk =
-                                (uint32_t*)(buffer.data() + entry.Thunk.rvaFirstThunk);
-                            *pThunk = entry.Thunk.rvaNameFunction;
-                        }
-                        else {
-                            uint64_t* pThunk =
-                                (uint64_t*)(buffer.data() + entry.Thunk.rvaFirstThunk);
-                            *pThunk = entry.Thunk.rvaNameFunction;
-                        }
-                    }
-                    // If it is imported by Ordinal, restore the ordinal flag
-                    else if (entry.Thunk.wHint != 0 || entry.uszFunction == nullptr) {
-                        if (is32Bit) {
-                            uint32_t* pThunk =
-                                (uint32_t*)(buffer.data() + entry.Thunk.rvaFirstThunk);
-                            *pThunk = 0x80000000 | entry.Thunk.wHint;
-                        }
-                        else {
-                            uint64_t* pThunk =
-                                (uint64_t*)(buffer.data() + entry.Thunk.rvaFirstThunk);
-                            *pThunk = 0x8000000000000000 | entry.Thunk.wHint;
-                        }
-                    }
+                // Patch the IAT entry in our buffer
+                if (entry.Thunk.rvaNameFunction != 0) {
+                     // We have a name/ordinal match
+                    if (is32Bit)
+                        *reinterpret_cast<uint32_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = entry.Thunk.rvaNameFunction;
+                    else
+                        *reinterpret_cast<uint64_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = entry.Thunk.rvaNameFunction;
+                } else if (entry.Thunk.wHint != 0) {
+                     // Ordinal import
+                    if (is32Bit)
+                        *reinterpret_cast<uint32_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = 0x80000000 | entry.Thunk.wHint;
+                    else
+                        *reinterpret_cast<uint64_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = 0x8000000000000000ULL | entry.Thunk.wHint;
                 }
             }
-            VMMDLL_MemFree(pIatMap); // Critical: Free the allocated map
+            VMMDLL_MemFree(pIatMap);
         }
 
-        // 4. Write the repaired executable to disk
+        // 8. Write to disk
         std::ofstream outFile(outPath, std::ios::binary);
         if (!outFile)
             return false;
 
-        outFile.write((char*)buffer.data(), buffer.size());
+        outFile.write(reinterpret_cast<char*>(buffer.data()), buffer.size());
         outFile.close();
-
         return true;
     }
-
     // ==========================================
     // Keyboard Support
     // ==========================================

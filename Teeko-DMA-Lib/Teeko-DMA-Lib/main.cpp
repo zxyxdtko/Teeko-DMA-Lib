@@ -11,7 +11,7 @@ auto main() -> int
 
     std::cout << "[+] DMA initialized successfully!" << std::endl;
 
-    if (!g_Dma.Attach("svchost.exe"))
+    if (!g_Dma.Attach("destiny2.exe"))
     {
         std::cout << "[-] Failed to attach to destiny2.exe" << std::endl;
         system("pause");
@@ -38,6 +38,8 @@ auto main() -> int
     {
         std::cout << "[+] " << name << ": 0x" << std::hex << g_Dma.GetScanResult(name) << std::dec << "\n";
     }
+
+    g_Dma.DumpModule("destiny2.exe", "d2_dump.exe");
 
     std::cout << "[+] Starting keyboard loop (Press W/A/D to test)..." << std::endl;
     while (true)

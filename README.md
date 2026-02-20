@@ -81,8 +81,10 @@ if (g_Dma.ExecuteScatter()) {
 ```
 
 
-### Module Dumping
-The `DumpModule` function allows you to dump a running module to disk, automatically fixing section headers and the Import Address Table (IAT) for analysis in tools like IDA Pro.
+### Module Dumping (Linear Dump)
+The `DumpModule` function now uses a **Linear Dump (Virtual Dump)** strategy. It maps the file on disk exactly as it appears in memory (Virtual Address == Raw Offset). This is highly effective for dumping packed or obfuscated modules (e.g., Themida, VMProtect).
+
+**Note:** The output file will have `FileAlignment` set to match `SectionAlignment`. Tools like IDA Pro load this perfectly, but the raw file on disk will be larger due to memory alignment.
 
 ```cpp
 if (g_Dma.DumpModule("unityplayer.dll", "C:\\Dumps\\unityplayer_dump.dll")) {
