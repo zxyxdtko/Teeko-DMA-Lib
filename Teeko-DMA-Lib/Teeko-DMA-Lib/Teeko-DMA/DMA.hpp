@@ -388,6 +388,11 @@ public:
     /// <summary>Returns the Process ID (PID) of the attached target.</summary>
     inline DWORD GetPID() const { return targetPID; }
 
+    /// <summary>
+    /// Returns the VMM_HANDLE
+    /// </summary>
+    inline VMM_HANDLE GetVMM() const { return hVMM; }
+
     // ==========================================
     // Raw Memory IO & Traversal
     // ==========================================
