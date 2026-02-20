@@ -322,7 +322,7 @@ public:
             return false;
 
         // Use NOCACHE to ensure we are querying the physical memory state right now
-        uint16_t magic = Read<uint16_t>(mainModuleBase, VMMDLL_FLAG_NOCACHE);
+        uint16_t magic = Read<uint16_t>(mainModuleBase);
         return magic == 0x5A4D; // 0x5A4D is 'MZ'
     }
 
@@ -400,13 +400,12 @@ public:
     /// <param name="size">Number of bytes to read.</param>
     /// <param name="flags">VMMDLL flags (e.g., VMMDLL_FLAG_NOCACHE).</param>
     /// <returns>True if the read was successful.</returns>
-    inline bool ReadRaw(uint64_t address, void* buffer, size_t size,
-        ULONG64 flags = 0) {
+    inline bool ReadRaw(uint64_t address, void* buffer, size_t size) {
         if (!hVMM || targetPID == 0 || address == 0)
             return false;
         DWORD bytesRead = 0;
         return VMMDLL_MemReadEx(hVMM, targetPID, address, (PBYTE)buffer, size,
-            &bytesRead, flags);
+            &bytesRead, VMMDLL_FLAG_NOCACHE);
     }
 
     /// <summary>
@@ -429,9 +428,9 @@ public:
     /// <param name="address">Target virtual address.</param>
     /// <param name="flags">VMMDLL flags.</param>
     /// <returns>The read value, or T{} on failure.</returns>
-    template <typename T> inline T Read(uint64_t address, ULONG64 flags = 0) {
+    template <typename T> inline T Read(uint64_t address) {
         T buffer{};
-        ReadRaw(address, &buffer, sizeof(T), flags);
+        ReadRaw(address, &buffer, sizeof(T));
         return buffer;
     }
 
