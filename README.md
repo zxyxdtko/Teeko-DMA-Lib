@@ -80,11 +80,31 @@ if (g_Dma.ExecuteScatter()) {
 }
 ```
 
+
 ### Module Dumping
 The `DumpModule` function allows you to dump a running module to disk, automatically fixing section headers and the Import Address Table (IAT) for analysis in tools like IDA Pro.
 
 ```cpp
 if (g_Dma.DumpModule("unityplayer.dll", "C:\\Dumps\\unityplayer_dump.dll")) {
     std::cout << "[+] Module dumped successfully!" << std::endl;
+}
+```
+
+### Keyboard Support
+Teeko-DMA-Lib includes built-in support for reading keyboard state directly from kernel memory (via `win32kbase.sys`), allowing for low-latency key detection without standard Windows APIs.
+
+```cpp
+// 1. Initialize Keyboard (starts a background polling thread)
+if (g_Dma.InitKeyboard(10)) { // Poll every 10ms
+    std::cout << "[+] Keyboard initialized" << std::endl;
+}
+
+// 2. Check Key State
+if (g_Dma.IsKeyDown('A')) {
+    std::cout << "A key is held down" << std::endl;
+}
+
+if (g_Dma.IsKeyPressed(VK_SPACE)) {
+    std::cout << "Space bar was just pressed" << std::endl;
 }
 ```

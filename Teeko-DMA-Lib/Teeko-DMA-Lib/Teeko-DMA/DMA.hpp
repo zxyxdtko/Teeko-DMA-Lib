@@ -6,6 +6,9 @@
 #include <vector>
 
 #include <chrono>
+#include <filesystem>
+#include <thread>
+#include <mutex>
 
 #pragma comment(lib, "vmm.lib")
 #pragma comment(lib, "leechcore.lib")
@@ -45,11 +48,62 @@ private:
         queuedModuleScans;
     std::unordered_map<std::string, uint64_t> scanResults;
 
+    struct HeapProfile {
+        bool fPrivateMemory = false;
+        DWORD VadType = 0;
+        bool valid = false;
+    };
+    HeapProfile heapProfile;
+
     // --- Keyboard State ---
     uint64_t gafAsyncKeyStateExport = 0;
-    uint8_t state_bitmap[64] = { 0 };
-    std::chrono::time_point<std::chrono::system_clock> section_start;
     DWORD win_logon_pid = 0;
+    uint8_t state_bitmap[64] = { 0 };
+    uint8_t prev_bitmap[64] = { 0 };
+    std::atomic<bool> kb_running = false;
+    std::thread kb_thread;
+    std::mutex kb_mutex;
+    uint8_t pressed_bitmap[64] = { 0 };
+    uint8_t released_bitmap[64] = { 0 };
+
+    inline void KeyboardThread(int poll_ms = 10) {
+        while (kb_running.load()) {
+            if (hVMM && gafAsyncKeyStateExport) {
+                uint8_t tmp[64] = { 0 };
+                DWORD bytesRead = 0;
+                if (VMMDLL_MemReadEx(hVMM,
+                    win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                    gafAsyncKeyStateExport,
+                    reinterpret_cast<PBYTE>(tmp),
+                    64, &bytesRead, VMMDLL_FLAG_NOCACHE)) {
+                    std::lock_guard<std::mutex> lock(kb_mutex);
+                    for (int i = 0; i < 64; i++) {
+                        uint8_t became_set = tmp[i] & ~state_bitmap[i]; // bits that turned on
+                        uint8_t became_clear = state_bitmap[i] & ~tmp[i]; // bits that turned off
+                        pressed_bitmap[i] |= became_set;
+                        released_bitmap[i] |= became_clear;
+                    }
+                    memcpy(state_bitmap, tmp, 64);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        }
+    }
+
+    // Call this after InitKeyboard succeeds
+    inline void StartKeyboardThread(int poll_ms = 10) {
+        kb_running = true;
+        kb_thread = std::thread(&DMA::KeyboardThread, this, poll_ms);
+    }
+
+    /// <summary>
+    /// Stops the background keyboard polling thread.
+    /// </summary>
+    inline void StopKeyboardThread() {
+        kb_running = false;
+        if (kb_thread.joinable())
+            kb_thread.join();
+    }
 
     inline std::vector<PatternByte> ParseSignature(const std::string& signature) {
         std::vector<PatternByte> pattern;
@@ -117,16 +171,18 @@ private:
         if (!VMMDLL_Map_GetVadU(hVMM, targetPID, TRUE, &pVadMap) || !pVadMap)
             return heaps;
 
-        heaps.reserve(pVadMap->cMap);
         for (DWORD i = 0; i < pVadMap->cMap; ++i) {
             const auto& vad = pVadMap->pMap[i];
+            size_t sz = vad.vaEnd - vad.vaStart;
 
-            if (vad.MemCommit == 1 && vad.fPrivateMemory == 1 && vad.fImage == 0 &&
-                vad.fFile == 0 && vad.fTeb == 0 && vad.fStack == 0 &&
-                vad.VadType == 0) {
-                heaps.push_back({ vad.vaStart, vad.vaEnd });
-            }
+            if (vad.fImage || vad.fFile || vad.fTeb || vad.fStack) continue;
+            if (sz == 0 || sz > 0x80000000) continue;
+            if (!vad.fPrivateMemory) continue;  // learned: fPrivateMemory = 1
+            if (vad.VadType != 0)   continue;  // learned: VadType = 0
+
+            heaps.push_back({ vad.vaStart, vad.vaEnd });
         }
+
         VMMDLL_MemFree(pVadMap);
         return heaps;
     }
@@ -144,17 +200,83 @@ public:
     /// Initializes the VMMDLL interface with default FPGA settings.
     /// </summary>
     /// <returns>True if initialization was successful, false otherwise.</returns>
-    inline bool Initialize() {
-        const char* args[] = { "", /*"-printf",*/ "-device", "fpga" };
-        int argc = sizeof(args) / sizeof(args[0]);
-        hVMM = VMMDLL_Initialize(argc, (LPCSTR*)args);
-        return hVMM != nullptr;
+    inline bool Initialize(bool memMap = true, bool debug = false)
+    {
+        // Start clean (prevents stale handles from breaking re-init attempts)
+        Disconnect();
+
+        auto build_and_init = [&](bool useMemMap) -> bool {
+            // Keep backing strings alive until after Initialize returns
+            std::vector<std::string> store;
+            store.reserve(8);
+
+            store.push_back("");               // argv[0] (dummy program name)
+            store.push_back("-device");
+            store.push_back("fpga://algo=0");
+
+            if (debug) {
+                store.push_back("-v");
+                store.push_back("-printf");
+            }
+
+            std::string memMapPath;
+            if (useMemMap) {
+                try {
+                    auto tmp = std::filesystem::temp_directory_path();
+                    memMapPath = (tmp / "mmap.txt").string();
+                }
+                catch (...) {
+                    useMemMap = false;
+                }
+
+                // Only add -memmap if the file exists (or you know you created it)
+                if (useMemMap && std::filesystem::exists(memMapPath)) {
+                    store.push_back("-memmap");
+                    store.push_back(memMapPath);
+                }
+                else {
+                    // If caller requested memmap but file doesn't exist, treat as "no memmap"
+                    // (or you can return false here if you want strict behavior)
+                }
+            }
+
+            std::vector<LPCSTR> argv;
+            argv.reserve(store.size());
+            for (auto& s : store) argv.push_back(s.c_str());
+
+            // Prefer InitializeEx so you can inspect extended error info in a debugger if needed
+            PLC_CONFIG_ERRORINFO pErr = nullptr;
+            hVMM = VMMDLL_InitializeEx((DWORD)argv.size(), argv.data(), &pErr);
+
+            if (!hVMM) {
+                // If you have leechcore.h available, pErr can be inspected in the debugger.
+                // Free if present.
+                if (pErr) {
+                    LcMemFree(pErr);
+                }
+                return false;
+            }
+            return true;
+            };
+
+        // First attempt: with memmap if requested
+        if (memMap) {
+            if (build_and_init(true)) return true;
+
+            // Retry without memmap (matches your other codes behavior)
+            Disconnect();
+            return build_and_init(false);
+        }
+
+        // No memmap requested
+        return build_and_init(false);
     }
 
     /// <summary>
     /// Closes all active VMMDLL handles and cleans up resources.
     /// </summary>
     inline void Disconnect() {
+        StopKeyboardThread();
         if (hScatter) {
             VMMDLL_Scatter_CloseHandle(hScatter);
             hScatter = nullptr;
@@ -471,28 +593,61 @@ public:
     /// </summary>
     inline uint64_t SigScanHeap(const std::string& signature) {
         std::vector<PatternByte> pattern = ParseSignature(signature);
-        if (pattern.empty())
+        if (pattern.empty()) {
+            std::cout << "[HEAP] Pattern empty after parse\n";
             return 0;
+        }
 
         std::vector<HeapRegion> heaps = GetHeapRegions();
+        std::cout << "[HEAP] Region count: " << heaps.size() << "\n";
         if (heaps.empty())
             return 0;
 
+        constexpr size_t CHUNK_SIZE = 0x1000000;
+        size_t totalBytesRead = 0;
+        int failedDumps = 0;
+        int successDumps = 0;
+
         for (const auto& r : heaps) {
             size_t regionSize = r.end - r.start;
-            if (regionSize == 0 || regionSize > 0x10000000)
+            if (regionSize == 0)
                 continue;
 
-            std::vector<uint8_t> localDump =
-                DumpMemory(r.start, regionSize,
+            for (size_t offset = 0; offset < regionSize; offset += CHUNK_SIZE) {
+                size_t chunkSize = min(CHUNK_SIZE, regionSize - offset);
+                std::vector<uint8_t> localDump = DumpMemory(
+                    r.start + offset, chunkSize,
                     VMMDLL_FLAG_NOCACHE | VMMDLL_FLAG_ZEROPAD_ON_FAIL);
-            if (localDump.empty())
-                continue;
 
-            uint64_t match = ScanLocalBuffer(localDump, r.start, pattern);
-            if (match)
-                return match;
+                if (localDump.empty()) {
+                    failedDumps++;
+                    std::cout << "[HEAP] DumpMemory FAILED: 0x" << std::hex
+                        << (r.start + offset) << " size=0x" << chunkSize << std::dec << "\n";
+                    continue;
+                }
+
+                successDumps++;
+                totalBytesRead += localDump.size();
+
+                // Check if dump is all zeros (ZEROPAD filled it but read failed silently)
+                bool allZero = std::all_of(localDump.begin(), localDump.end(), [](uint8_t b) { return b == 0; });
+                if (allZero) {
+                    std::cout << "[HEAP] WARNING: Dump all-zero (silent fail?): 0x" << std::hex
+                        << (r.start + offset) << std::dec << "\n";
+                    continue;
+                }
+
+                uint64_t match = ScanLocalBuffer(localDump, r.start + offset, pattern);
+                if (match) {
+                    std::cout << "[HEAP] Match found at 0x" << std::hex << match << std::dec << "\n";
+                    return match;
+                }
+            }
         }
+
+        std::cout << "[HEAP] Scan complete. Successful dumps: " << successDumps
+            << " Failed: " << failedDumps
+            << " Total bytes scanned: 0x" << std::hex << totalBytesRead << std::dec << "\n";
         return 0;
     }
 
@@ -626,7 +781,13 @@ public:
     // Keyboard Support
     // ==========================================
 
-    inline bool InitKeyboard() {
+    /// <summary>
+    /// Initialize the keyboard state reader.
+    /// Finds the gafAsyncKeyState export in win32kbase.sys/win32k.sys and starts a background thread to poll it.
+    /// </summary>
+    /// <param name="poll_ms">Interval in milliseconds to poll the keyboard state (default: 10ms).</param>
+    /// <returns>True if initialization was successful, false otherwise.</returns>
+    inline bool InitKeyboard(int poll_ms) {
         if (!hVMM)
             return false;
 
@@ -634,17 +795,20 @@ public:
         DWORD type = 0;
         DWORD size = 0;
 
-        // Query Windows Build Number
         if (VMMDLL_WinReg_QueryValueExU(hVMM,
-            "HKLM\\SOFTWARE\\Microsoft\\Windows "
-            "NT\\CurrentVersion\\CurrentBuild",
+            "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\CurrentBuild",
             &type, nullptr, &size)) {
-            std::vector<uint8_t> buffer(size);
+            std::vector<uint8_t> buffer(size + 2, 0);
             if (VMMDLL_WinReg_QueryValueExU(hVMM,
-                "HKLM\\SOFTWARE\\Microsoft\\Windows "
-                "NT\\CurrentVersion\\CurrentBuild",
+                "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\CurrentBuild",
                 &type, buffer.data(), &size)) {
-                win = std::string((char*)buffer.data());
+                if (size >= 2 && buffer[1] == 0) {
+                    std::wstring ws(reinterpret_cast<wchar_t*>(buffer.data()));
+                    win = std::string(ws.begin(), ws.end());
+                }
+                else {
+                    win = std::string(reinterpret_cast<char*>(buffer.data()));
+                }
             }
         }
 
@@ -660,8 +824,6 @@ public:
             return false;
 
         if (Winver > 22000) {
-            // Windows 11+ Logic
-            PDWORD pPids = nullptr;
             SIZE_T cPids = 0;
             if (!VMMDLL_PidList(hVMM, nullptr, &cPids))
                 return false;
@@ -671,26 +833,20 @@ public:
                 return false;
 
             for (DWORD pid : pids) {
-                // Check if process is csrss.exe
                 LPSTR szName = VMMDLL_ProcessGetInformationString(
                     hVMM, pid, VMMDLL_PROCESS_INFORMATION_OPT_STRING_PATH_USER_IMAGE);
-
                 if (!szName)
                     continue;
 
                 std::string procName(szName);
-                VMMDLL_MemFree(szName); // Important: Free the string
+                VMMDLL_MemFree(szName);
 
-                // Check if it contains "csrss.exe"
-                if (procName.find("csrss.exe") == std::string::npos) {
+                if (procName.find("csrss.exe") == std::string::npos)
                     continue;
-                }
 
-                auto getModule =
-                    [&](const std::string& name) -> std::pair<uint64_t, uint32_t> {
+                auto getModule = [&](const std::string& name) -> std::pair<uint64_t, uint32_t> {
                     PVMMDLL_MAP_MODULEENTRY pModuleMapEntry = nullptr;
-                    if (VMMDLL_Map_GetModuleFromNameU(hVMM, pid, name.c_str(),
-                        &pModuleMapEntry, 0)) {
+                    if (VMMDLL_Map_GetModuleFromNameU(hVMM, pid, name.c_str(), &pModuleMapEntry, 0)) {
                         uint64_t base = pModuleMapEntry->vaBase;
                         uint32_t sz = pModuleMapEntry->cbImageSize;
                         VMMDLL_MemFree(pModuleMapEntry);
@@ -708,14 +864,12 @@ public:
                         continue;
                 }
 
-                std::vector<uint8_t> win32k_dump =
-                    DumpMemory(win32k_base, win32k_size, 0);
+                std::vector<uint8_t> win32k_dump = DumpMemory(win32k_base, win32k_size, 0);
                 if (win32k_dump.empty())
                     continue;
 
                 auto sig1 = ParseSignature("48 8B 05 ? ? ? ? 48 8B 04 C8");
-                uint64_t g_session_ptr =
-                    ScanLocalBuffer(win32k_dump, win32k_base, sig1);
+                uint64_t g_session_ptr = ScanLocalBuffer(win32k_dump, win32k_base, sig1);
 
                 if (!g_session_ptr) {
                     auto sig2 = ParseSignature("48 8B 05 ? ? ? ? FF C9");
@@ -741,8 +895,7 @@ public:
                 if (!win32kbase_base)
                     continue;
 
-                std::vector<uint8_t> win32kbase_dump =
-                    DumpMemory(win32kbase_base, win32kbase_size, 0);
+                std::vector<uint8_t> win32kbase_dump = DumpMemory(win32kbase_base, win32kbase_size, 0);
                 if (win32kbase_dump.empty())
                     continue;
 
@@ -753,17 +906,21 @@ public:
                     uint32_t session_offset = Read<uint32_t>(ptr + 3);
                     gafAsyncKeyStateExport = user_session_state + session_offset;
                 }
+                else {
+                    continue;
+                }
 
                 if (gafAsyncKeyStateExport > 0x7FFFFFFFFFFF)
                     return true;
             }
+
             return false;
+
         }
         else {
-            // Windows 10 Logic
             PVMMDLL_MAP_EAT pEatMap = nullptr;
-            if (VMMDLL_Map_GetEATU(
-                hVMM, win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+            if (VMMDLL_Map_GetEATU(hVMM,
+                win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                 "win32kbase.sys", &pEatMap)) {
                 if (pEatMap->dwVersion == VMMDLL_MAP_EAT_VERSION) {
                     for (DWORD i = 0; i < pEatMap->cMap; i++) {
@@ -778,45 +935,74 @@ public:
 
             if (gafAsyncKeyStateExport < 0x7FFFFFFFFFFF) {
                 PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
-                if (VMMDLL_Map_GetModuleFromNameU(
-                    hVMM, win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                if (VMMDLL_Map_GetModuleFromNameU(hVMM,
+                    win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                     "win32kbase.sys", &pModuleEntry, 0)) {
-                    char szModuleName[MAX_PATH];
-                    if (VMMDLL_PdbLoad(
-                        hVMM, win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                    char szModuleName[MAX_PATH] = {};
+                    if (VMMDLL_PdbLoad(hVMM,
+                        win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                         pModuleEntry->vaBase, szModuleName)) {
                         uint64_t va = 0;
-                        if (VMMDLL_PdbSymbolAddress(hVMM, szModuleName, "gafAsyncKeyState",
-                            &va)) {
+                        if (VMMDLL_PdbSymbolAddress(hVMM, szModuleName, "gafAsyncKeyState", &va))
                             gafAsyncKeyStateExport = va;
-                        }
                     }
                     VMMDLL_MemFree(pModuleEntry);
                 }
             }
+            bool valid = gafAsyncKeyStateExport > 0x7FFFFFFFFFFF;
 
-            return gafAsyncKeyStateExport > 0x7FFFFFFFFFFF;
+            if (valid)
+            {
+                StartKeyboardThread(poll_ms);
+            }
+
+            return valid;
         }
     }
 
-    inline void UpdateKeys() {
-        if (!hVMM || !gafAsyncKeyStateExport)
-            return;
-        ReadRaw(gafAsyncKeyStateExport, state_bitmap, 64,
-            VMMDLL_FLAG_NOCACHE | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY);
-    }
-
+    // Is the key currently held
+    /// <summary>
+    /// Check if a key is currently held down.
+    /// </summary>
+    /// <param name="vk">Virtual Key code to check.</param>
+    /// <returns>True if the key is down, false otherwise.</returns>
     inline bool IsKeyDown(uint32_t vk) {
-        if (!hVMM || !gafAsyncKeyStateExport)
-            return false;
-        auto now = std::chrono::system_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now -
-            section_start)
-            .count() > 100) {
-            UpdateKeys();
-            section_start = now;
+        std::lock_guard<std::mutex> lock(kb_mutex);
+        return (state_bitmap[(vk * 2 / 8)] & (1 << (vk % 4 * 2))) != 0;
+    }
+
+    // Was the key just pressed this poll (down now, not down before)
+    /// <summary>
+    /// Check if a key was just pressed since the last poll (rising edge).
+    /// </summary>
+    /// <param name="vk">Virtual Key code to check.</param>
+    /// <returns>True if the key was just pressed, false otherwise.</returns>
+    inline bool IsKeyPressed(uint32_t vk) {
+        std::lock_guard<std::mutex> lock(kb_mutex);
+        int byte = vk * 2 / 8;
+        int bit = 1 << (vk % 4 * 2);
+        if (pressed_bitmap[byte] & bit) {
+            pressed_bitmap[byte] &= ~bit; // clear on read
+            return true;
         }
-        return state_bitmap[(vk * 2 / 8)] & (1 << (vk % 4 * 2));
+        return false;
+    }
+
+    // Was the key just released this poll
+    /// <summary>
+    /// Check if a key was just released since the last poll (falling edge).
+    /// </summary>
+    /// <param name="vk">Virtual Key code to check.</param>
+    /// <returns>True if the key was just released, false otherwise.</returns>
+    inline bool IsKeyReleased(uint32_t vk) {
+        std::lock_guard<std::mutex> lock(kb_mutex);
+        int byte = vk * 2 / 8;
+        int bit = 1 << (vk % 4 * 2);
+        if (released_bitmap[byte] & bit) {
+            released_bitmap[byte] &= ~bit; // clear on read
+            return true;
+        }
+        return false;
     }
 };
 
