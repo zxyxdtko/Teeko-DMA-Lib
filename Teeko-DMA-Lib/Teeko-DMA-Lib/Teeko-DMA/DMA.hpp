@@ -924,7 +924,18 @@ public:
                 }
 
                 if (gafAsyncKeyStateExport > 0x7FFFFFFFFFFF)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(kb_mutex);
+                        memset(state_bitmap, 0, sizeof(state_bitmap));
+                        memset(prev_bitmap, 0, sizeof(prev_bitmap));
+                        memset(pressed_bitmap, 0, sizeof(pressed_bitmap));
+                        memset(released_bitmap, 0, sizeof(released_bitmap));
+                    }
+
+                    StartKeyboardThread(poll_ms);
                     return true;
+                }
             }
 
             return false;
