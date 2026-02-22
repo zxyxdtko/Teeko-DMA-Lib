@@ -4,18 +4,20 @@ A lightweight, header-only C++ DMA (Direct Memory Access) library wrapper around
 
 ## Features
 
--   **Easy Initialization**: Simple wrapper around `VMMDLL_Initialize`.
--   **Process Attachment**: detailed process finding and module base caching.
+-   **Easy Initialization**: Simple wrapper around `VMMDLL_InitializeEx`, configurable to use memory-map files and enable debugging.
+-   **Process Attachment**: Detailed process finding and module base caching.
 -   **Memory I/O**: Read/Write primitives for standard types and raw buffers.
+-   **Advanced Memory Traversal**: Helpers for resolving RIP-relative addressing, reading `std::wstring`, and following multi-level pointer chains (`ReadChain`).
 -   **Scatter Reading**: Efficiently batched memory reads using VMMDLL scatter functionality.
 -   **Signature Scanning**:
-    -   Pattern scanning within specific modules.
-    -   Heap scanning support.
+    -   Pattern scanning within specific modules (batch/queued via `QueueModuleScan` / `ExecuteModuleScans`).
+    -   Heap scanning support (`SigScanHeap`) for locating signatures in dynamically allocated private process memory.
 -   **Anti-Cheat Bypass Helpers**:
     -   `IsCR3Valid` check.
     -   `SetCR3` for DTB preservation/fixing.
     -   `ClearCache` to handle memory layout changes.
--   **Module Dumping**: `DumpModule` function to reconstruct modules from memory to disk (fixes Section Headers and IAT).
+-   **Module Dumping**: `DumpModule` function to reconstruct modules from memory to disk using a **Linear Dump** strategy (fixes Section Headers and IAT).
+-   **Keyboard & Mouse Support**: Reads global keyboard states and cursor coordinates directly from `win32kbase.sys`.
 
 ## Prerequisites
 
@@ -38,8 +40,10 @@ A lightweight, header-only C++ DMA (Direct Memory Access) library wrapper around
 #include "Teeko-DMA/DMA.hpp"
 
 int main() {
-    // 1. Initialize VMMDLL (assumes FPGA device by default)
-    if (!g_Dma.Initialize()) {
+    // 1. Initialize VMMDLL
+    // arg 1: bool memMap - whether to use a local memory map file (mmap.txt)
+    // arg 2: bool debug - whether to enable VMMDLL -v and -printf debug logging
+    if (!g_Dma.Initialize(true, false)) {
         std::cout << "[-] Failed to initialize DMA" << std::endl;
         return 1;
     }
@@ -55,11 +59,18 @@ int main() {
 }
 ```
 
-### Reading Memory
+### Reading Memory & Following Chains
 ```cpp
 uint64_t base = g_Dma.GetMainBase();
 int health = g_Dma.Read<int>(base + 0x1234);
 std::string playerName = g_Dma.ReadString(base + 0xABCD, 32);
+
+// Resolve relative offsets (e.g. from an instruction like mov rax, [rip+0x1234])
+uint64_t absoluteAddr = g_Dma.ResolveRelative(instructionAddr, 3, 7);
+
+// Follow pointer chains automatically
+std::vector<uint64_t> offsets = {0x10, 0x20, 0x280};
+uint64_t finalAddr = g_Dma.ReadChain(base + 0x5000, offsets);
 ```
 
 ### Scatter Reading (High Performance)
@@ -80,6 +91,24 @@ if (g_Dma.ExecuteScatter()) {
 }
 ```
 
+### Signature Scanning
+
+**Module Scanning (Batched):**
+```cpp
+// Queue multiple scans for a module to execute them efficiently over a single module dump
+g_Dma.QueueModuleScan("svchost.exe", "RegQueryDword", "40 53 48 83 EC ? 49 8B D8");
+g_Dma.QueueModuleScan("svchost.exe", "AnotherPattern", "48 8B 05 ? ? ? ? 48 85 C0");
+
+g_Dma.ExecuteModuleScans();
+
+uint64_t funcAddr = g_Dma.GetScanResult("RegQueryDword");
+```
+
+**Heap Scanning:**
+```cpp
+// Scan the entire private process heap (Warning: Potentially slow on large games)
+uint64_t localPlayerPtrMatch = g_Dma.SigScanHeap("48 8B 05 ? ? ? ? 48 85 C0 74 05");
+```
 
 ### Module Dumping (Linear Dump)
 The `DumpModule` function now uses a **Linear Dump (Virtual Dump)** strategy. It maps the file on disk exactly as it appears in memory (Virtual Address == Raw Offset). This is highly effective for dumping packed or obfuscated modules (e.g., Themida, VMProtect).
@@ -92,11 +121,12 @@ if (g_Dma.DumpModule("unityplayer.dll", "C:\\Dumps\\unityplayer_dump.dll")) {
 }
 ```
 
-### Keyboard Support
-Teeko-DMA-Lib includes built-in support for reading keyboard state directly from kernel memory (via `win32kbase.sys`), allowing for low-latency key detection without standard Windows APIs.
+### Keyboard & Mouse Support
+Teeko-DMA-Lib includes built-in support for reading keyboard state and global cursor coordinates directly from kernel memory (via `win32kbase.sys`), allowing for low-latency detection without standard Windows APIs.
 
 ```cpp
 // 1. Initialize Keyboard (starts a background polling thread)
+// This will automatically parse PDB data/EAT data for exports needed to read from win32kbase.sys
 if (g_Dma.InitKeyboard(10)) { // Poll every 10ms
     std::cout << "[+] Keyboard initialized" << std::endl;
 }
@@ -107,6 +137,10 @@ if (g_Dma.IsKeyDown('A')) {
 }
 
 if (g_Dma.IsKeyPressed(VK_SPACE)) {
-    std::cout << "Space bar was just pressed" << std::endl;
+    std::cout << "Space bar was just pressed (rising edge)" << std::endl;
 }
+
+// 3. Read Mouse State
+POINT pt = g_Dma.GetCursorPosition();
+std::cout << "Cursor X: " << pt.x << ", Y: " << pt.y << std::endl;
 ```
