@@ -9,13 +9,14 @@
 #include <filesystem>
 #include <thread>
 #include <mutex>
+#include <iostream>
 
 #pragma comment(lib, "vmm.lib")
 #pragma comment(lib, "leechcore.lib")
 
 struct HeapRegion {
-  uint64_t start;
-  uint64_t end;
+    uint64_t start;
+    uint64_t end;
 };
 
 class DMA {
@@ -728,29 +729,29 @@ public:
         // Force section alignment to match file alignment (usually page size 0x1000)
         // This tells tools that the file is effectively "flat"
         pNt->OptionalHeader.FileAlignment = pNt->OptionalHeader.SectionAlignment;
-        
+
         // Fix section headers to point effectively to themselves
         for (WORD i = 0; i < numSections; i++) {
             // Point the raw data to the virtual address.
             // In a linear dump, the data exists in the file at the exact same offset as its RVA.
             pSection[i].PointerToRawData = pSection[i].VirtualAddress;
-            
+
             // Ensure the size is aligned and valid
             pSection[i].SizeOfRawData = pSection[i].Misc.VirtualSize;
         }
 
         // Fix IAT if possible (Import Address Table)
         // Many packers will destroy the IAT or redirect it. VMMDLL can help us reconstruct it.
-        
+
         // Zero bound imports directory as it is invalid in a dump
-        if(pNt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT) {
-             pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
-             pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
+        if (pNt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT) {
+            pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
+            pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
         }
 
         // Zero IAT directory to force regeneration by analysis tools, or we can try to fix it.
         // For a raw dump, often better to clear it if we can't fully rebuild it, but we will try to patch what we can.
-        
+
         // Attempt to fix imports using VMMDLL's analysis
         PVMMDLL_MAP_IAT pIatMap = nullptr;
         if (VMMDLL_Map_GetIATU(hVMM, targetPID, moduleName.c_str(), &pIatMap) && pIatMap) {
@@ -758,20 +759,21 @@ public:
                 const auto& entry = pIatMap->pMap[i];
                 if (entry.Thunk.rvaFirstThunk == 0)
                     continue;
-                
+
                 // Ensure we are within bounds of our dump
                 if ((entry.Thunk.rvaFirstThunk + (is32Bit ? 4 : 8)) > buffer.size())
                     continue;
 
                 // Patch the IAT entry in our buffer
                 if (entry.Thunk.rvaNameFunction != 0) {
-                     // We have a name/ordinal match
+                    // We have a name/ordinal match
                     if (is32Bit)
                         *reinterpret_cast<uint32_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = entry.Thunk.rvaNameFunction;
                     else
                         *reinterpret_cast<uint64_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = entry.Thunk.rvaNameFunction;
-                } else if (entry.Thunk.wHint != 0) {
-                     // Ordinal import
+                }
+                else if (entry.Thunk.wHint != 0) {
+                    // Ordinal import
                     if (is32Bit)
                         *reinterpret_cast<uint32_t*>(buffer.data() + entry.Thunk.rvaFirstThunk) = 0x80000000 | entry.Thunk.wHint;
                     else
@@ -1027,6 +1029,72 @@ public:
             return true;
         }
         return false;
+    }
+
+    /// <summary>
+        /// Reads the global mouse cursor position from win32kbase.sys
+        /// Note: win_logon_pid must be initialized first (e.g., by calling InitKeyboard).
+        /// </summary>
+    inline POINT GetCursorPosition() {
+        POINT pt = { 0, 0 };
+
+        // Change: Check win_logon_pid instead of targetPID
+        // You MUST call InitKeyboard() before this will work so win_logon_pid is populated.
+        if (!hVMM || win_logon_pid == 0)
+            return pt;
+
+        static uint64_t gptCursorAsyncExport = 0;
+        static bool initFailed = false;
+
+        if (initFailed) return pt;
+
+        // 1. Resolve gptCursorAsync via PDB
+        if (gptCursorAsyncExport == 0) {
+            PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
+
+            // Change: Use win_logon_pid here
+            if (VMMDLL_Map_GetModuleFromNameU(hVMM,
+                win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                "win32kbase.sys", &pModuleEntry, 0)) {
+
+                char szModuleName[MAX_PATH] = {};
+
+                // Change: Use win_logon_pid here
+                if (VMMDLL_PdbLoad(hVMM,
+                    win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                    pModuleEntry->vaBase, szModuleName)) {
+
+                    uint64_t va = 0;
+                    if (VMMDLL_PdbSymbolAddress(hVMM, szModuleName, "gptCursorAsync", &va)) {
+                        gptCursorAsyncExport = va;
+                    }
+                }
+                VMMDLL_MemFree(pModuleEntry);
+            }
+
+            // If we failed to find it, flag it so we don't spam PDB loads
+            if (gptCursorAsyncExport == 0) {
+                initFailed = true;
+                return pt;
+            }
+        }
+
+        // 2. Read the POINT struct directly from the exported address
+        if (gptCursorAsyncExport != 0) {
+            DWORD bytesRead = 0;
+
+            // Change: Use win_logon_pid here
+            if (!VMMDLL_MemReadEx(hVMM,
+                win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                gptCursorAsyncExport, (PBYTE)&pt, sizeof(POINT),
+                &bytesRead, VMMDLL_FLAG_NOCACHE)) {
+
+                // Failsafe: return 0,0 if the read fails so the sync logic skips it
+                pt = { 0, 0 };
+            }
+        }
+
+        return pt;
     }
 };
 
