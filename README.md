@@ -7,8 +7,8 @@ A lightweight, header-only C++ DMA (Direct Memory Access) library wrapper around
 -   **Easy Initialization**: Simple wrapper around `VMMDLL_InitializeEx`, configurable to use memory-map files and enable debugging.
 -   **Process Attachment**: Detailed process finding and module base caching.
 -   **Memory I/O**: Read/Write primitives for standard types and raw buffers.
--   **Advanced Memory Traversal**: Helpers for resolving RIP-relative addressing, reading `std::wstring`, and following multi-level pointer chains (`ReadChain`).
--   **Scatter Reading**: Efficiently batched memory reads using VMMDLL scatter functionality.
+-   **Advanced Memory Traversal**: Helpers for resolving RIP-relative addressing (`ResolveRelative`), reading strings (`ReadString`, `ReadWString`), and following multi-level pointer chains (`ReadChain`).
+-   **Scatter Reading**: Efficiently batched memory reads using VMMDLL scatter functionality (`AddScatter`, `ExecuteScatter`).
 -   **Signature Scanning**:
     -   Pattern scanning within specific modules (batch/queued via `QueueModuleScan` / `ExecuteModuleScans`).
     -   Heap scanning support (`SigScanHeap`) for locating signatures in dynamically allocated private process memory.
@@ -17,7 +17,7 @@ A lightweight, header-only C++ DMA (Direct Memory Access) library wrapper around
     -   `SetCR3` for DTB preservation/fixing.
     -   `ClearCache` to handle memory layout changes.
 -   **Module Dumping**: `DumpModule` function to reconstruct modules from memory to disk using a **Linear Dump** strategy (fixes Section Headers and IAT).
--   **Keyboard & Mouse Support**: Reads global keyboard states and cursor coordinates directly from `win32kbase.sys`.
+-   **Keyboard & Mouse Support**: Reads global keyboard states (`IsKeyDown`, `IsKeyPressed`, `IsKeyReleased`) and cursor coordinates (`GetCursorPosition`) directly from `win32kbase.sys`.
 
 ## Prerequisites
 

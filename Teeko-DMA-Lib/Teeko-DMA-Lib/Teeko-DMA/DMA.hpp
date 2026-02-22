@@ -178,8 +178,8 @@ private:
 
             if (vad.fImage || vad.fFile || vad.fTeb || vad.fStack) continue;
             if (sz == 0 || sz > 0x80000000) continue;
-            if (!vad.fPrivateMemory) continue;  // learned: fPrivateMemory = 1
-            if (vad.VadType != 0)   continue;  // learned: VadType = 0
+            if (!vad.fPrivateMemory) continue;
+            if (vad.VadType != 0)   continue;
 
             heaps.push_back({ vad.vaStart, vad.vaEnd });
         }
@@ -193,25 +193,19 @@ public:
 
     inline ~DMA() { Disconnect(); }
 
-    // ==========================================
-    // Core Device Lifecycle
-    // ==========================================
-
     /// <summary>
     /// Initializes the VMMDLL interface with default FPGA settings.
     /// </summary>
     /// <returns>True if initialization was successful, false otherwise.</returns>
     inline bool Initialize(bool memMap = true, bool debug = false)
     {
-        // Start clean (prevents stale handles from breaking re-init attempts)
+        // Start clean
         Disconnect();
 
         auto build_and_init = [&](bool useMemMap) -> bool {
-            // Keep backing strings alive until after Initialize returns
             std::vector<std::string> store;
             store.reserve(8);
 
-            store.push_back("");               // argv[0] (dummy program name)
             store.push_back("-device");
             store.push_back("fpga://algo=0");
 
@@ -236,8 +230,7 @@ public:
                     store.push_back(memMapPath);
                 }
                 else {
-                    // If caller requested memmap but file doesn't exist, treat as "no memmap"
-                    // (or you can return false here if you want strict behavior)
+
                 }
             }
 
@@ -250,8 +243,6 @@ public:
             hVMM = VMMDLL_InitializeEx((DWORD)argv.size(), argv.data(), &pErr);
 
             if (!hVMM) {
-                // If you have leechcore.h available, pErr can be inspected in the debugger.
-                // Free if present.
                 if (pErr) {
                     LcMemFree(pErr);
                 }
@@ -260,11 +251,11 @@ public:
             return true;
             };
 
-        // First attempt: with memmap if requested
+        // Attempt with memmap
         if (memMap) {
             if (build_and_init(true)) return true;
 
-            // Retry without memmap (matches your other codes behavior)
+            // Retry without memmap
             Disconnect();
             return build_and_init(false);
         }
@@ -309,10 +300,6 @@ public:
         return false;
     }
 
-    // ==========================================
-    // CR3 / DTB Management (Anti-Cheat Bypass)
-    // ==========================================
-
     /// <summary>
     /// Verifies if the current Directory Table Base (DTB/CR3) is valid.
     /// Checks for the "MZ" header at the main module base.
@@ -322,9 +309,8 @@ public:
         if (!hVMM || targetPID == 0 || mainModuleBase == 0)
             return false;
 
-        // Use NOCACHE to ensure we are querying the physical memory state right now
         uint16_t magic = Read<uint16_t>(mainModuleBase);
-        return magic == 0x5A4D; // 0x5A4D is 'MZ'
+        return magic == 0x5A4D;
     }
 
     /// <summary>
