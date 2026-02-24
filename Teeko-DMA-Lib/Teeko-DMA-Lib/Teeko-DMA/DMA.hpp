@@ -1,4 +1,5 @@
-#pragma once
+﻿#pragma once
+
 #include "deps/vmmdll.h"
 #include <fstream>
 #include <string>
@@ -19,7 +20,7 @@ struct HeapRegion {
     uint64_t end;
 };
 
-class DMA {
+class _DMA {
 private:
     VMM_HANDLE hVMM = nullptr;
     DWORD targetPID = 0;
@@ -94,7 +95,7 @@ private:
     // Call this after InitKeyboard succeeds
     inline void StartKeyboardThread(int poll_ms = 10) {
         kb_running = true;
-        kb_thread = std::thread(&DMA::KeyboardThread, this, poll_ms);
+        kb_thread = std::thread(&_DMA::KeyboardThread, this, poll_ms);
     }
 
     /// <summary>
@@ -178,8 +179,8 @@ private:
 
             if (vad.fImage || vad.fFile || vad.fTeb || vad.fStack) continue;
             if (sz == 0 || sz > 0x80000000) continue;
-            if (!vad.fPrivateMemory) continue;
-            if (vad.VadType != 0)   continue;
+            if (!vad.fPrivateMemory) continue;  // learned: fPrivateMemory = 1
+            if (vad.VadType != 0)   continue;  // learned: VadType = 0
 
             heaps.push_back({ vad.vaStart, vad.vaEnd });
         }
@@ -189,9 +190,13 @@ private:
     }
 
 public:
-    DMA() = default;
+    _DMA() = default;
 
-    inline ~DMA() { Disconnect(); }
+    inline ~_DMA() { Disconnect(); }
+
+    // ==========================================
+    // Core Device Lifecycle
+    // ==========================================
 
     /// <summary>
     /// Initializes the VMMDLL interface with default FPGA settings.
@@ -199,13 +204,15 @@ public:
     /// <returns>True if initialization was successful, false otherwise.</returns>
     inline bool Initialize(bool memMap = true, bool debug = false)
     {
-        // Start clean
+        // Start clean (prevents stale handles from breaking re-init attempts)
         Disconnect();
 
         auto build_and_init = [&](bool useMemMap) -> bool {
+            // Keep backing strings alive until after Initialize returns
             std::vector<std::string> store;
             store.reserve(8);
 
+            store.push_back("");               // argv[0] (dummy program name)
             store.push_back("-device");
             store.push_back("fpga://algo=0");
 
@@ -230,7 +237,8 @@ public:
                     store.push_back(memMapPath);
                 }
                 else {
-
+                    // If caller requested memmap but file doesn't exist, treat as "no memmap"
+                    // (or you can return false here if you want strict behavior)
                 }
             }
 
@@ -243,6 +251,8 @@ public:
             hVMM = VMMDLL_InitializeEx((DWORD)argv.size(), argv.data(), &pErr);
 
             if (!hVMM) {
+                // If you have leechcore.h available, pErr can be inspected in the debugger.
+                // Free if present.
                 if (pErr) {
                     LcMemFree(pErr);
                 }
@@ -251,11 +261,11 @@ public:
             return true;
             };
 
-        // Attempt with memmap
+        // First attempt: with memmap if requested
         if (memMap) {
             if (build_and_init(true)) return true;
 
-            // Retry without memmap
+            // Retry without memmap (matches your other codes behavior)
             Disconnect();
             return build_and_init(false);
         }
@@ -300,6 +310,10 @@ public:
         return false;
     }
 
+    // ==========================================
+    // CR3 / DTB Management (Anti-Cheat Bypass)
+    // ==========================================
+
     /// <summary>
     /// Verifies if the current Directory Table Base (DTB/CR3) is valid.
     /// Checks for the "MZ" header at the main module base.
@@ -309,8 +323,9 @@ public:
         if (!hVMM || targetPID == 0 || mainModuleBase == 0)
             return false;
 
+        // Use NOCACHE to ensure we are querying the physical memory state right now
         uint16_t magic = Read<uint16_t>(mainModuleBase);
-        return magic == 0x5A4D;
+        return magic == 0x5A4D; // 0x5A4D is 'MZ'
     }
 
     /// <summary>
@@ -972,7 +987,6 @@ public:
         }
     }
 
-    // Is the key currently held
     /// <summary>
     /// Check if a key is currently held down.
     /// </summary>
@@ -1021,67 +1035,94 @@ public:
         /// Reads the global mouse cursor position from win32kbase.sys
         /// Note: win_logon_pid must be initialized first (e.g., by calling InitKeyboard).
         /// </summary>
-    inline POINT GetCursorPosition() {
+    inline POINT GetCursorPosition(bool debug = false) {
         POINT pt = { 0, 0 };
 
-        // Change: Check win_logon_pid instead of targetPID
-        // You MUST call InitKeyboard() before this will work so win_logon_pid is populated.
-        if (!hVMM || win_logon_pid == 0)
+        if (!hVMM || win_logon_pid == 0) {
+            if (debug) printf("[CursorPos] FAIL: hVMM=%p win_logon_pid=%u\n", hVMM, win_logon_pid);
             return pt;
+        }
 
         static uint64_t gptCursorAsyncExport = 0;
-        static bool initFailed = false;
 
-        if (initFailed) return pt;
-
-        // 1. Resolve gptCursorAsync via PDB
         if (gptCursorAsyncExport == 0) {
-            PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
+            if (debug) printf("[CursorPos] Attempting to resolve gptCursorAsync via sig scan...\n");
 
-            // Change: Use win_logon_pid here
-            if (VMMDLL_Map_GetModuleFromNameU(hVMM,
+            PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
+            if (!VMMDLL_Map_GetModuleFromNameU(hVMM,
                 win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                 "win32kbase.sys", &pModuleEntry, 0)) {
-
-                char szModuleName[MAX_PATH] = {};
-
-                // Change: Use win_logon_pid here
-                if (VMMDLL_PdbLoad(hVMM,
-                    win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
-                    pModuleEntry->vaBase, szModuleName)) {
-
-                    uint64_t va = 0;
-                    if (VMMDLL_PdbSymbolAddress(hVMM, szModuleName, "gptCursorAsync", &va)) {
-                        gptCursorAsyncExport = va;
-                    }
-                }
-                VMMDLL_MemFree(pModuleEntry);
+                if (debug) printf("[CursorPos] FAIL: Could not find win32kbase.sys in pid=%u\n", win_logon_pid);
+                return pt;
             }
 
-            // If we failed to find it, flag it so we don't spam PDB loads
+            uint64_t base = pModuleEntry->vaBase;
+            uint32_t size = pModuleEntry->cbImageSize;
+            VMMDLL_MemFree(pModuleEntry);
+
+            if (debug) printf("[CursorPos] win32kbase.sys found, vaBase=0x%llx size=0x%x\n", base, size);
+
+            // Dump using win_logon_pid kernel context, NOT targetPID
+            std::vector<uint8_t> dump(size);
+            DWORD bytesRead = 0;
+            if (!VMMDLL_MemReadEx(hVMM,
+                win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                base, dump.data(), size, &bytesRead, VMMDLL_FLAG_ZEROPAD_ON_FAIL)) {
+                if (debug) printf("[CursorPos] FAIL: Could not dump win32kbase.sys bytesRead=%u\n", bytesRead);
+                return pt;
+            }
+
+            if (debug) printf("[CursorPos] Dumped win32kbase.sys bytesRead=%u\n", bytesRead);
+
+            struct SigEntry { const char* name; const char* pattern; };
+            SigEntry sigs[] = {
+                { "Sig2", "4C 8B 0D ? ? ? ? 48 8D 55" },
+                { "Sig3", "48 8B 05 ? ? ? ? 49 89 86" },
+                { "Sig4", "48 8B 0D ? ? ? ? 48 89 0D" },
+                { "Sig5", "4C 8B 0D ? ? ? ? 4C 8B C5" },
+            };
+
+            for (auto& sig : sigs) {
+                auto pattern = ParseSignature(sig.pattern);
+                uint64_t hit = ScanLocalBuffer(dump, base, pattern);
+                if (!hit) {
+                    if (debug) printf("[CursorPos] %s: no match\n", sig.name);
+                    continue;
+                }
+
+                int32_t rel = *reinterpret_cast<int32_t*>(&dump[hit - base + 3]);
+                uint64_t va = hit + 7 + rel;
+
+                if (debug) printf("[CursorPos] %s hit=0x%llx rel=0x%x resolved va=0x%llx\n", sig.name, hit, rel, va);
+
+                if (va > 0x7FFFFFFFFFFF) {
+                    gptCursorAsyncExport = va;
+                    if (debug) printf("[CursorPos] gptCursorAsync resolved to 0x%llx via %s\n", va, sig.name);
+                    break;
+                }
+
+                if (debug) printf("[CursorPos] %s resolved va 0x%llx failed kernel address check\n", sig.name, va);
+            }
+
             if (gptCursorAsyncExport == 0) {
-                initFailed = true;
+                if (debug) printf("[CursorPos] FAIL: All sigs failed to resolve gptCursorAsync\n");
                 return pt;
             }
         }
 
-        // 2. Read the POINT struct directly from the exported address
-        if (gptCursorAsyncExport != 0) {
-            DWORD bytesRead = 0;
-
-            // Change: Use win_logon_pid here
-            if (!VMMDLL_MemReadEx(hVMM,
-                win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
-                gptCursorAsyncExport, (PBYTE)&pt, sizeof(POINT),
-                &bytesRead, VMMDLL_FLAG_NOCACHE)) {
-
-                // Failsafe: return 0,0 if the read fails so the sync logic skips it
-                pt = { 0, 0 };
-            }
+        DWORD bytesRead = 0;
+        if (!VMMDLL_MemReadEx(hVMM,
+            win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+            gptCursorAsyncExport, (PBYTE)&pt, sizeof(POINT),
+            &bytesRead, VMMDLL_FLAG_NOCACHE)) {
+            if (debug) printf("[CursorPos] FAIL: MemReadEx failed at 0x%llx bytesRead=%u\n", gptCursorAsyncExport, bytesRead);
+            pt = { 0, 0 };
+            return pt;
         }
 
+        if (debug) printf("[CursorPos] OK: x=%ld y=%ld\n", pt.x, pt.y);
         return pt;
     }
 };
 
-inline DMA g_Dma;
+inline _DMA g_Dma;
