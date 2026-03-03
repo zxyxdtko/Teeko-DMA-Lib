@@ -194,9 +194,22 @@ public:
 
     inline ~_DMA() { Disconnect(); }
 
-    // ==========================================
-    // Core Device Lifecycle
-    // ==========================================
+    /// <summary>
+    /// Returns the global _DMA singleton instance.
+    /// </summary>
+    /// <remarks>
+    /// The instance is lazily initialized on first call and is guaranteed
+    /// to be thread-safe since C++11. The object has static storage duration
+    /// and is destroyed during program shutdown.
+    /// </remarks>
+    /// <returns>
+    /// Reference to the unique _DMA instance (never null).
+    /// </returns>
+    static _DMA& Get()
+    {
+        static _DMA instance;
+        return instance;
+    }
 
     /// <summary>
     /// Initializes the VMMDLL interface with default FPGA settings.
@@ -1124,5 +1137,3 @@ public:
         return pt;
     }
 };
-
-inline _DMA g_Dma;

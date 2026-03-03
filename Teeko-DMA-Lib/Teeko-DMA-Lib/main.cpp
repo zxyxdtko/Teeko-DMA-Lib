@@ -3,7 +3,9 @@
 
 auto main() -> int
 {
-    if (!g_Dma.Initialize(true, false)) {
+    auto& dma = _DMA::Get();
+
+    if (!dma.Initialize(true, false)) {
         std::cout << "[-] Failed to initialize DMA!" << std::endl;
         system("pause");
         return -1;
@@ -11,7 +13,7 @@ auto main() -> int
 
     std::cout << "[+] DMA initialized successfully!" << std::endl;
 
-    if (!g_Dma.Attach("svchost.exe"))
+    if (!dma.Attach("svchost.exe"))
     {
         std::cout << "[-] Failed to attach to svchost.exe" << std::endl;
         system("pause");
@@ -19,16 +21,16 @@ auto main() -> int
     }
 
     // 3. Initialize Keyboard Support (poll every 10ms)
-    if (!g_Dma.InitKeyboard(10))
+    if (!dma.InitKeyboard(10))
     {
         std::cout << "[-] Failed to initialize keyboard" << std::endl;
     }
 
     // Queue a scan for a specific registry function example
-    g_Dma.QueueModuleScan("svchost.exe", "RegQueryDword", "40 53 48 83 EC ? 49 8B D8");
+    dma.QueueModuleScan("svchost.exe", "RegQueryDword", "40 53 48 83 EC ? 49 8B D8");
 
     // Execute all queued scans
-    g_Dma.ExecuteModuleScans();
+    dma.ExecuteModuleScans();
 
     const std::vector<std::string> scanNames = {
         "RegQueryDword",
@@ -36,16 +38,16 @@ auto main() -> int
 
     for (const auto& name : scanNames)
     {
-        std::cout << "[+] " << name << ": 0x" << std::hex << g_Dma.GetScanResult(name) << std::dec << "\n";
+        std::cout << "[+] " << name << ": 0x" << std::hex << dma.GetScanResult(name) << std::dec << "\n";
     }
 
     std::cout << "[+] Test key polling... (W, A, and D)" << std::endl;
     while (true)
     {
         // Example usage of keyboard functions
-        if (g_Dma.IsKeyPressed('W')) std::cout << "[+] W key pressed" << std::endl;
-        if (g_Dma.IsKeyDown('A')) std::cout << "[+] A key pressed" << std::endl;
-        if (g_Dma.IsKeyReleased('D')) std::cout << "[+] D key released" << std::endl;
+        if (dma.IsKeyPressed('W')) std::cout << "[+] W key pressed" << std::endl;
+        if (dma.IsKeyDown('A')) std::cout << "[+] A key pressed" << std::endl;
+        if (dma.IsKeyReleased('D')) std::cout << "[+] D key released" << std::endl;
     }
 
     system("pause");
