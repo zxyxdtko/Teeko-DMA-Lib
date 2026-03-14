@@ -565,7 +565,12 @@ public:
         if (!VMMDLL_MemReadEx(hVMM, targetPID, address, buffer.data(), size,
             &bytesRead, flags))
             buffer.clear();
-        else if (bytesRead != size)
+        // When ZEROPAD_ON_FAIL is set, VMMDLL fills unreadable pages with zeros
+        // and still returns true, but bytesRead may be less than size. The buffer
+        // is fully allocated and zero-padded — do NOT trim it or sig scans over
+        // large modules (with guard pages / uncommitted sections) will silently
+        // miss patterns that fall in the latter half of the image.
+        else if (!(flags & VMMDLL_FLAG_ZEROPAD_ON_FAIL) && bytesRead != size)
             buffer.resize(bytesRead);
         return buffer;
     }
@@ -587,7 +592,7 @@ public:
         if (!VMMDLL_MemReadEx(hVMM, pid, address, buffer.data(), size,
             &bytesRead, flags))
             buffer.clear();
-        else if (bytesRead != size)
+        else if (!(flags & VMMDLL_FLAG_ZEROPAD_ON_FAIL) && bytesRead != size)
             buffer.resize(bytesRead);
         return buffer;
     }
