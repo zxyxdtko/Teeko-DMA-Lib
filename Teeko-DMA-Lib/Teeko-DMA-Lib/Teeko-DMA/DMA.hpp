@@ -570,6 +570,28 @@ public:
         return buffer;
     }
 
+    /// <summary>
+    /// Reads a block of memory using an explicit PID (e.g. a csrss/winlogon pid
+    /// ORed with VMMDLL_PID_PROCESS_WITH_KERNELMEMORY for kernel module dumps).
+    /// Use this instead of DumpMemory whenever the target address lives in kernel
+    /// space (win32k.sys, win32kbase.sys, win32ksgd.sys, etc.).
+    /// </summary>
+    inline std::vector<uint8_t>
+        DumpMemoryEx(DWORD pid, uint64_t address, size_t size,
+            ULONG64 flags = VMMDLL_FLAG_ZEROPAD_ON_FAIL) {
+        std::vector<uint8_t> buffer;
+        if (!hVMM || address == 0 || size == 0)
+            return buffer;
+        buffer.resize(size);
+        DWORD bytesRead = 0;
+        if (!VMMDLL_MemReadEx(hVMM, pid, address, buffer.data(), size,
+            &bytesRead, flags))
+            buffer.clear();
+        else if (bytesRead != size)
+            buffer.resize(bytesRead);
+        return buffer;
+    }
+
     /// <summary>Add a signature scan request to the queue.</summary>
     inline void QueueModuleScan(const std::string& moduleName,
         const std::string& scanName,
@@ -816,9 +838,11 @@ public:
     /// </summary>
     /// <param name="poll_ms">Interval in milliseconds to poll the keyboard state (default: 10ms).</param>
     /// <returns>True if initialization was successful, false otherwise.</returns>
-    inline bool InitKeyboard(int poll_ms) {
-        if (!hVMM)
+    inline bool InitKeyboard(int poll_ms, bool debug = false) {
+        if (!hVMM) {
+            if (debug) printf("[InitKeyboard] FAIL: hVMM is null\n");
             return false;
+        }
 
         std::string win = "0";
         DWORD type = 0;
@@ -839,27 +863,50 @@ public:
                     win = std::string(reinterpret_cast<char*>(buffer.data()));
                 }
             }
+            else {
+                if (debug) printf("[InitKeyboard] WARN: Second RegQuery (with buffer) failed, using default build=\"0\"\n");
+            }
         }
+        else {
+            if (debug) printf("[InitKeyboard] WARN: First RegQuery (size probe) failed, using default build=\"0\"\n");
+        }
+
+        if (debug) printf("[InitKeyboard] Raw build string: \"%s\"\n", win.c_str());
 
         int Winver = 0;
         try {
             Winver = std::stoi(win);
         }
         catch (...) {
+            if (debug) printf("[InitKeyboard] FAIL: Could not parse build string \"%s\" as integer\n", win.c_str());
             return false;
         }
 
-        if (!VMMDLL_PidGetFromName(hVMM, "winlogon.exe", &win_logon_pid))
-            return false;
+        if (debug) printf("[InitKeyboard] Winver=%d (threshold 22000, path=%s)\n",
+            Winver, Winver > 22000 ? "Win11/csrss sig-scan" : "Win10/EAT");
 
+        if (!VMMDLL_PidGetFromName(hVMM, "winlogon.exe", &win_logon_pid)) {
+            if (debug) printf("[InitKeyboard] FAIL: Could not find winlogon.exe pid\n");
+            return false;
+        }
+        if (debug) printf("[InitKeyboard] winlogon.exe pid=%u\n", win_logon_pid);
+
+        // ---------------------------------------------------------------
+        // Win11+ path: locate gafAsyncKeyState via csrss session sig-scan
+        // ---------------------------------------------------------------
         if (Winver > 22000) {
             SIZE_T cPids = 0;
-            if (!VMMDLL_PidList(hVMM, nullptr, &cPids))
+            if (!VMMDLL_PidList(hVMM, nullptr, &cPids)) {
+                if (debug) printf("[InitKeyboard] FAIL: VMMDLL_PidList (count probe) failed\n");
                 return false;
+            }
+            if (debug) printf("[InitKeyboard] Total process count: %zu\n", cPids);
 
             std::vector<DWORD> pids(cPids);
-            if (!VMMDLL_PidList(hVMM, pids.data(), &cPids))
+            if (!VMMDLL_PidList(hVMM, pids.data(), &cPids)) {
+                if (debug) printf("[InitKeyboard] FAIL: VMMDLL_PidList (fill) failed\n");
                 return false;
+            }
 
             for (DWORD pid : pids) {
                 LPSTR szName = VMMDLL_ProcessGetInformationString(
@@ -873,6 +920,9 @@ public:
                 if (procName.find("csrss.exe") == std::string::npos)
                     continue;
 
+                if (debug) printf("[InitKeyboard] Found csrss candidate: pid=%u path=\"%s\"\n",
+                    pid, procName.c_str());
+
                 auto getModule = [&](const std::string& name) -> std::pair<uint64_t, uint32_t> {
                     PVMMDLL_MAP_MODULEENTRY pModuleMapEntry = nullptr;
                     if (VMMDLL_Map_GetModuleFromNameU(hVMM, pid, name.c_str(), &pModuleMapEntry, 0)) {
@@ -884,63 +934,126 @@ public:
                     return { 0, 0 };
                     };
 
+                // --- Locate win32ksgd.sys or win32k.sys ---
                 auto [win32k_base, win32k_size] = getModule("win32ksgd.sys");
-                if (!win32k_base) {
+                if (win32k_base) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] win32ksgd.sys base=0x%llx size=0x%x\n",
+                        pid, win32k_base, win32k_size);
+                }
+                else {
+                    if (debug) printf("[InitKeyboard] [pid=%u] win32ksgd.sys not found, trying win32k.sys\n", pid);
                     auto res = getModule("win32k.sys");
                     win32k_base = res.first;
                     win32k_size = res.second;
-                    if (!win32k_base)
+                    if (!win32k_base) {
+                        if (debug) printf("[InitKeyboard] [pid=%u] win32k.sys not found either, skipping\n", pid);
                         continue;
+                    }
+                    if (debug) printf("[InitKeyboard] [pid=%u] win32k.sys base=0x%llx size=0x%x\n",
+                        pid, win32k_base, win32k_size);
                 }
 
-                std::vector<uint8_t> win32k_dump = DumpMemory(win32k_base, win32k_size, 0);
-                if (win32k_dump.empty())
+                // --- Dump win32k(sgd).sys ---
+                std::vector<uint8_t> win32k_dump = DumpMemoryEx(
+                    pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                    win32k_base, win32k_size, VMMDLL_FLAG_ZEROPAD_ON_FAIL);
+                if (win32k_dump.empty()) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] FAIL: DumpMemory returned empty for win32k base=0x%llx\n",
+                        pid, win32k_base);
                     continue;
+                }
+                if (debug) printf("[InitKeyboard] [pid=%u] Dumped win32k, bytes=%zu\n", pid, win32k_dump.size());
 
+                // --- Sig1: g_session_global_slots ---
                 auto sig1 = ParseSignature("48 8B 05 ? ? ? ? 48 8B 04 C8");
                 uint64_t g_session_ptr = ScanLocalBuffer(win32k_dump, win32k_base, sig1);
-
-                if (!g_session_ptr) {
+                if (g_session_ptr) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] Sig1 hit at 0x%llx\n", pid, g_session_ptr);
+                }
+                else {
+                    if (debug) printf("[InitKeyboard] [pid=%u] Sig1 no match, trying Sig2\n", pid);
                     auto sig2 = ParseSignature("48 8B 05 ? ? ? ? FF C9");
                     g_session_ptr = ScanLocalBuffer(win32k_dump, win32k_base, sig2);
+                    if (g_session_ptr) {
+                        if (debug) printf("[InitKeyboard] [pid=%u] Sig2 hit at 0x%llx\n", pid, g_session_ptr);
+                    }
+                    else {
+                        if (debug) printf("[InitKeyboard] [pid=%u] Sig2 no match, skipping this csrss\n", pid);
+                        continue;
+                    }
                 }
 
-                if (!g_session_ptr)
-                    continue;
-
-                int relative = Read<int>(g_session_ptr + 3);
+                int relative = *reinterpret_cast<int*>(&win32k_dump[g_session_ptr - win32k_base + 3]);
                 uint64_t g_session_global_slots = g_session_ptr + 7 + relative;
+                if (debug) printf("[InitKeyboard] [pid=%u] relative=0x%x g_session_global_slots=0x%llx\n",
+                    pid, (uint32_t)relative, g_session_global_slots);
+
+                // --- Walk slot table to find user_session_state ---
+                // All pointer reads here are kernel addresses, must use kernel-context pid.
+                DWORD kpid = pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY;
+                auto KRead64 = [&](uint64_t addr) -> uint64_t {
+                    uint64_t val = 0;
+                    DWORD br = 0;
+                    VMMDLL_MemReadEx(hVMM, kpid, addr, reinterpret_cast<PBYTE>(&val),
+                        sizeof(val), &br, VMMDLL_FLAG_NOCACHE);
+                    return val;
+                    };
 
                 uint64_t user_session_state = 0;
                 for (int i = 0; i < 4; i++) {
-                    uint64_t ptr1 = Read<uint64_t>(g_session_global_slots);
-                    uint64_t ptr2 = Read<uint64_t>(ptr1 + 8 * i);
-                    user_session_state = Read<uint64_t>(ptr2);
-                    if (user_session_state > 0x7FFFFFFFFFFF)
+                    uint64_t ptr1 = KRead64(g_session_global_slots);
+                    uint64_t ptr2 = KRead64(ptr1 + 8 * i);
+                    user_session_state = KRead64(ptr2);
+                    if (debug) printf("[InitKeyboard] [pid=%u] slot[%d]: ptr1=0x%llx ptr2=0x%llx uss=0x%llx\n",
+                        pid, i, ptr1, ptr2, user_session_state);
+                    if (user_session_state > 0x7FFFFFFFFFFF) {
+                        if (debug) printf("[InitKeyboard] [pid=%u] user_session_state valid at slot %d\n", pid, i);
                         break;
+                    }
+                }
+                if (user_session_state <= 0x7FFFFFFFFFFF) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] WARN: No valid user_session_state found in any slot (last=0x%llx)\n",
+                        pid, user_session_state);
                 }
 
+                // --- Locate win32kbase.sys ---
                 auto [win32kbase_base, win32kbase_size] = getModule("win32kbase.sys");
-                if (!win32kbase_base)
+                if (!win32kbase_base) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] FAIL: win32kbase.sys not found, skipping\n", pid);
                     continue;
+                }
+                if (debug) printf("[InitKeyboard] [pid=%u] win32kbase.sys base=0x%llx size=0x%x\n",
+                    pid, win32kbase_base, win32kbase_size);
 
-                std::vector<uint8_t> win32kbase_dump = DumpMemory(win32kbase_base, win32kbase_size, 0);
-                if (win32kbase_dump.empty())
+                // --- Dump win32kbase.sys ---
+                std::vector<uint8_t> win32kbase_dump = DumpMemoryEx(
+                    pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+                    win32kbase_base, win32kbase_size, VMMDLL_FLAG_ZEROPAD_ON_FAIL);
+                if (win32kbase_dump.empty()) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] FAIL: DumpMemory returned empty for win32kbase base=0x%llx\n",
+                        pid, win32kbase_base);
                     continue;
+                }
+                if (debug) printf("[InitKeyboard] [pid=%u] Dumped win32kbase, bytes=%zu\n", pid, win32kbase_dump.size());
 
+                // --- Sig3: session_offset for gafAsyncKeyState ---
                 auto sig3 = ParseSignature("48 8D 90 ? ? ? ? E8 ? ? ? ? 0F 57 C0");
                 uint64_t ptr = ScanLocalBuffer(win32kbase_dump, win32kbase_base, sig3);
-
                 if (ptr) {
-                    uint32_t session_offset = Read<uint32_t>(ptr + 3);
+                    uint32_t session_offset = *reinterpret_cast<uint32_t*>(
+                        &win32kbase_dump[ptr - win32kbase_base + 3]);
                     gafAsyncKeyStateExport = user_session_state + session_offset;
+                    if (debug) printf("[InitKeyboard] [pid=%u] Sig3 hit=0x%llx session_offset=0x%x gafAsyncKeyStateExport=0x%llx\n",
+                        pid, ptr, session_offset, gafAsyncKeyStateExport);
                 }
                 else {
+                    if (debug) printf("[InitKeyboard] [pid=%u] Sig3 no match, skipping this csrss\n", pid);
                     continue;
                 }
 
-                if (gafAsyncKeyStateExport > 0x7FFFFFFFFFFF)
-                {
+                if (gafAsyncKeyStateExport > 0x7FFFFFFFFFFF) {
+                    if (debug) printf("[InitKeyboard] [pid=%u] gafAsyncKeyStateExport=0x%llx valid, starting kb thread\n",
+                        pid, gafAsyncKeyStateExport);
                     {
                         std::lock_guard<std::mutex> lock(kb_mutex);
                         memset(state_bitmap, 0, sizeof(state_bitmap));
@@ -948,51 +1061,97 @@ public:
                         memset(pressed_bitmap, 0, sizeof(pressed_bitmap));
                         memset(released_bitmap, 0, sizeof(released_bitmap));
                     }
-
                     StartKeyboardThread(poll_ms);
                     return true;
                 }
+                else {
+                    if (debug) printf("[InitKeyboard] [pid=%u] FAIL: gafAsyncKeyStateExport=0x%llx failed kernel address check\n",
+                        pid, gafAsyncKeyStateExport);
+                }
             }
 
+            if (debug) printf("[InitKeyboard] FAIL: Exhausted all csrss candidates without success\n");
             return false;
 
         }
+        // ---------------------------------------------------------------
+        // Win10 path: locate gafAsyncKeyState via EAT, fallback to PDB
+        // ---------------------------------------------------------------
         else {
+            if (debug) printf("[InitKeyboard] Win10 path: attempting EAT lookup for gafAsyncKeyState in win32kbase.sys\n");
+
             PVMMDLL_MAP_EAT pEatMap = nullptr;
             if (VMMDLL_Map_GetEATU(hVMM,
                 win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                 "win32kbase.sys", &pEatMap)) {
+                if (debug) printf("[InitKeyboard] EAT map obtained, version=%u entries=%u\n",
+                    pEatMap ? pEatMap->dwVersion : 0,
+                    pEatMap ? pEatMap->cMap : 0);
                 if (pEatMap->dwVersion == VMMDLL_MAP_EAT_VERSION) {
                     for (DWORD i = 0; i < pEatMap->cMap; i++) {
                         if (strcmp(pEatMap->pMap[i].uszFunction, "gafAsyncKeyState") == 0) {
                             gafAsyncKeyStateExport = pEatMap->pMap[i].vaFunction;
+                            if (debug) printf("[InitKeyboard] EAT found gafAsyncKeyState at 0x%llx (entry %u)\n",
+                                gafAsyncKeyStateExport, i);
                             break;
                         }
                     }
+                    if (gafAsyncKeyStateExport == 0) {
+                        if (debug) printf("[InitKeyboard] WARN: EAT version matched but gafAsyncKeyState not found in %u entries\n",
+                            pEatMap->cMap);
+                    }
+                }
+                else {
+                    if (debug) printf("[InitKeyboard] WARN: EAT version mismatch got=%u expected=%u\n",
+                        pEatMap->dwVersion, VMMDLL_MAP_EAT_VERSION);
                 }
                 VMMDLL_MemFree(pEatMap);
             }
+            else {
+                if (debug) printf("[InitKeyboard] WARN: VMMDLL_Map_GetEATU failed for win32kbase.sys in winlogon pid=%u\n",
+                    win_logon_pid);
+            }
 
+            // --- PDB fallback if EAT didn't give a valid kernel address ---
             if (gafAsyncKeyStateExport < 0x7FFFFFFFFFFF) {
+                if (debug) printf("[InitKeyboard] EAT result 0x%llx not a valid kernel addr, trying PDB fallback\n",
+                    gafAsyncKeyStateExport);
                 PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
                 if (VMMDLL_Map_GetModuleFromNameU(hVMM,
                     win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                     "win32kbase.sys", &pModuleEntry, 0)) {
+                    if (debug) printf("[InitKeyboard] PDB: win32kbase.sys base=0x%llx\n", pModuleEntry->vaBase);
                     char szModuleName[MAX_PATH] = {};
                     if (VMMDLL_PdbLoad(hVMM,
                         win_logon_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
                         pModuleEntry->vaBase, szModuleName)) {
+                        if (debug) printf("[InitKeyboard] PDB loaded: module name=\"%s\"\n", szModuleName);
                         uint64_t va = 0;
-                        if (VMMDLL_PdbSymbolAddress(hVMM, szModuleName, "gafAsyncKeyState", &va))
+                        if (VMMDLL_PdbSymbolAddress(hVMM, szModuleName, "gafAsyncKeyState", &va)) {
                             gafAsyncKeyStateExport = va;
+                            if (debug) printf("[InitKeyboard] PDB resolved gafAsyncKeyState to 0x%llx\n", va);
+                        }
+                        else {
+                            if (debug) printf("[InitKeyboard] FAIL: PDB symbol lookup for gafAsyncKeyState returned false\n");
+                        }
+                    }
+                    else {
+                        if (debug) printf("[InitKeyboard] FAIL: VMMDLL_PdbLoad returned false for win32kbase.sys\n");
                     }
                     VMMDLL_MemFree(pModuleEntry);
                 }
+                else {
+                    if (debug) printf("[InitKeyboard] FAIL: Could not find win32kbase.sys module entry in winlogon pid=%u\n",
+                        win_logon_pid);
+                }
             }
-            bool valid = gafAsyncKeyStateExport > 0x7FFFFFFFFFFF;
 
-            if (valid)
-            {
+            bool valid = gafAsyncKeyStateExport > 0x7FFFFFFFFFFF;
+            if (debug) printf("[InitKeyboard] Final gafAsyncKeyStateExport=0x%llx valid=%s\n",
+                gafAsyncKeyStateExport, valid ? "YES" : "NO");
+
+            if (valid) {
+                if (debug) printf("[InitKeyboard] Starting keyboard thread poll_ms=%d\n", poll_ms);
                 StartKeyboardThread(poll_ms);
             }
 

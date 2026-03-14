@@ -5,7 +5,7 @@ auto main() -> int
 {
     auto& dma = _DMA::Get();
 
-    if (!dma.Initialize(true, false)) {
+    if (!dma.Initialize(true, true)) {
         std::cout << "[-] Failed to initialize DMA!" << std::endl;
         system("pause");
         return -1;
@@ -21,7 +21,7 @@ auto main() -> int
     }
 
     // 3. Initialize Keyboard Support (poll every 10ms)
-    if (!dma.InitKeyboard(10))
+    if (!dma.InitKeyboard(10, true))
     {
         std::cout << "[-] Failed to initialize keyboard" << std::endl;
     }
@@ -46,7 +46,7 @@ auto main() -> int
     {
         // Example usage of keyboard functions
         if (dma.IsKeyPressed('W')) std::cout << "[+] W key pressed" << std::endl;
-        if (dma.IsKeyDown('A')) std::cout << "[+] A key pressed" << std::endl;
+        if (dma.IsKeyDown('A')) std::cout << "[+] A key held" << std::endl;
         if (dma.IsKeyReleased('D')) std::cout << "[+] D key released" << std::endl;
     }
 
