@@ -4,76 +4,78 @@ A lightweight, header-only C++ DMA (Direct Memory Access) library wrapper around
 
 ## Features
 
--   **Easy Initialization**: Simple wrapper around `VMMDLL_InitializeEx`, configurable to use memory-map files and enable debugging.
--   **Process Attachment**: Detailed process finding and module base caching.
--   **Memory I/O**: Read/Write primitives for standard types and raw buffers.
--   **Advanced Memory Traversal**: Helpers for resolving RIP-relative addressing (`ResolveRelative`), reading strings (`ReadString`, `ReadWString`), and following multi-level pointer chains (`ReadChain`).
--   **Scatter Reading**: Efficiently batched memory reads using VMMDLL scatter functionality (`AddScatter`, `ExecuteScatter`).
--   **Signature Scanning**:
-    -   Pattern scanning within specific modules (batch/queued via `QueueModuleScan` / `ExecuteModuleScans`).
-    -   Heap scanning support (`SigScanHeap`) for locating signatures in dynamically allocated private process memory.
--   **Anti-Cheat Bypass Helpers**:
-    -   `IsCR3Valid` check.
-    -   `SetCR3` for DTB preservation/fixing.
-    -   `ClearCache` to handle memory layout changes.
--   **Module Dumping**: `DumpModule` function to reconstruct modules from memory to disk using a **Linear Dump** strategy (fixes Section Headers and IAT).
--   **Keyboard & Mouse Support**: Reads global keyboard states (`IsKeyDown`, `IsKeyPressed`, `IsKeyReleased`) and cursor coordinates (`GetCursorPosition`) directly from `win32kbase.sys`.
+- **Easy Initialization**: Simple wrapper around `VMMDLL_InitializeEx`, configurable to use memory-map files and enable debugging.
+- **Process Attachment**: Process finding and module base caching.
+- **Memory I/O**: Read/Write primitives for standard types and raw buffers.
+- **Advanced Memory Traversal**: Helpers for resolving RIP-relative addressing (`ResolveRelative`), reading strings (`ReadString`, `ReadWString`), and following multi-level pointer chains (`ReadChain`).
+- **Scatter Reading**: Efficiently batched memory reads using VMMDLL scatter functionality (`AddScatter`, `ExecuteScatter`).
+- **Signature Scanning**:
+    - Pattern scanning within specific modules (batch/queued via `QueueModuleScan` / `ExecuteModuleScans`).
+    - Heap scanning support (`SigScanHeap`) for locating signatures in dynamically allocated private process memory.
+- **Anti-Cheat Bypass Helpers**: `IsCR3Valid`, `SetCR3`, and `ClearCache`.
+- **Module Dumping**: `DumpModule` reconstructs modules from memory to disk using a **Linear Dump** strategy (fixes Section Headers and IAT).
+- **Keyboard & Mouse Support**: Reads global keyboard state (`IsKeyDown`, `IsKeyPressed`, `IsKeyReleased`) and cursor coordinates (`GetCursorPosition`) directly from `win32kbase.sys`, with built-in debug logging.
 
 ## Prerequisites
 
--   **Hardware/Software**: A compatible DMA device (FPGA) or a software solution supported by MemProcFS.
--   **Libraries**:
-    -   `vmm.dll` and `leechcore.dll` must be present in the binary directory.
-    -   `vmm.lib` and `leechcore.lib` for linking.
+- **Hardware/Software**: A compatible DMA device (FPGA) or a software solution supported by MemProcFS.
+- **Libraries**:
+    - `vmm.dll` and `leechcore.dll` must be present in the binary directory.
+    - `vmm.lib` and `leechcore.lib` for linking.
 
 ## Installation
 
-1.  Clone this repository.
-2.  Ensure `deps/vmmdll.h` and libraries are in the correct paths.
-3.  Include `Teeko-DMA/DMA.hpp` in your project.
+1. Clone this repository.
+2. Ensure `deps/vmmdll.h` and the required libraries are in the correct paths.
+3. Include `Teeko-DMA/DMA.hpp` in your project.
 
 ## Usage
 
 ### Basic Setup
+
+The library exposes a singleton via `_DMA::Get()`.
+
 ```cpp
 #include <iostream>
 #include "Teeko-DMA/DMA.hpp"
 
-int main() {
-    // 1. Initialize VMMDLL
-    // arg 1: bool memMap - whether to use a local memory map file (mmap.txt)
-    // arg 2: bool debug - whether to enable VMMDLL -v and -printf debug logging
-    if (!g_Dma.Initialize(true, false)) {
-        std::cout << "[-] Failed to initialize DMA" << std::endl;
-        return 1;
-    }
+auto main() -> int
+{
+    auto& dma = _DMA::Get();
 
-    // 2. Attach to target process
-    if (!g_Dma.Attach("target_game.exe")) {
+    // arg 1: bool memMap  - use a local memory map file (mmap.txt in temp dir)
+    // arg 2: bool debug   - enable VMMDLL -v and -printf verbose logging
+    if (!dma.Initialize(true, false)) {
+        std::cout << "[-] Failed to initialize DMA!" << std::endl;
+        return -1;
+    }
+    std::cout << "[+] DMA initialized successfully!" << std::endl;
+
+    if (!dma.Attach("target_game.exe")) {
         std::cout << "[-] Failed to attach to process" << std::endl;
-        return 1;
+        return -2;
     }
 
-    std::cout << "[+] DMA Initialized & Attached!" << std::endl;
     return 0;
 }
 ```
 
 ### Reading Memory & Following Chains
+
 ```cpp
-uint64_t base = g_Dma.GetMainBase();
-int health = g_Dma.Read<int>(base + 0x1234);
-std::string playerName = g_Dma.ReadString(base + 0xABCD, 32);
+uint64_t base = dma.GetMainBase();
+int health = dma.Read<int>(base + 0x1234);
+std::string playerName = dma.ReadString(base + 0xABCD, 32);
 
-// Resolve relative offsets (e.g. from an instruction like mov rax, [rip+0x1234])
-uint64_t absoluteAddr = g_Dma.ResolveRelative(instructionAddr, 3, 7);
+// Resolve a RIP-relative address (e.g. from: mov rax, [rip+0x1234])
+uint64_t absoluteAddr = dma.ResolveRelative(instructionAddr, 3, 7);
 
-// Follow pointer chains automatically
-std::vector<uint64_t> offsets = {0x10, 0x20, 0x280};
-uint64_t finalAddr = g_Dma.ReadChain(base + 0x5000, offsets);
+// Follow a multi-level pointer chain
+uint64_t finalAddr = dma.ReadChain(base + 0x5000, { 0x10, 0x20, 0x280 });
 ```
 
 ### Scatter Reading (High Performance)
+
 ```cpp
 struct PlayerData {
     int health;
@@ -82,11 +84,11 @@ struct PlayerData {
 };
 
 PlayerData data;
-g_Dma.AddScatter(playerPtr + 0x100, &data.health);
-g_Dma.AddScatter(playerPtr + 0x104, &data.ammo);
-g_Dma.AddScatter(playerPtr + 0x200, &data.pos);
+dma.AddScatter(playerPtr + 0x100, &data.health);
+dma.AddScatter(playerPtr + 0x104, &data.ammo);
+dma.AddScatter(playerPtr + 0x200, &data.pos);
 
-if (g_Dma.ExecuteScatter()) {
+if (dma.ExecuteScatter()) {
     std::cout << "Health: " << data.health << std::endl;
 }
 ```
@@ -94,53 +96,90 @@ if (g_Dma.ExecuteScatter()) {
 ### Signature Scanning
 
 **Module Scanning (Batched):**
+
 ```cpp
-// Queue multiple scans for a module to execute them efficiently over a single module dump
-g_Dma.QueueModuleScan("svchost.exe", "RegQueryDword", "40 53 48 83 EC ? 49 8B D8");
-g_Dma.QueueModuleScan("svchost.exe", "AnotherPattern", "48 8B 05 ? ? ? ? 48 85 C0");
+// Queue multiple scans — a single module dump is shared across all of them
+dma.QueueModuleScan("svchost.exe", "RegQueryDword", "40 53 48 83 EC ? 49 8B D8");
+dma.QueueModuleScan("svchost.exe", "AnotherPattern", "48 8B 05 ? ? ? ? 48 85 C0");
 
-g_Dma.ExecuteModuleScans();
+dma.ExecuteModuleScans();
 
-uint64_t funcAddr = g_Dma.GetScanResult("RegQueryDword");
+uint64_t funcAddr = dma.GetScanResult("RegQueryDword");
+std::cout << "RegQueryDword: 0x" << std::hex << funcAddr << std::endl;
 ```
 
 **Heap Scanning:**
+
 ```cpp
-// Scan the entire private process heap (Warning: Potentially slow on large games)
-uint64_t localPlayerPtrMatch = g_Dma.SigScanHeap("48 8B 05 ? ? ? ? 48 85 C0 74 05");
+// Scan the entire private process heap (can be slow on large processes)
+uint64_t result = dma.SigScanHeap("48 8B 05 ? ? ? ? 48 85 C0 74 05");
 ```
 
-### Module Dumping (Linear Dump)
-The `DumpModule` function now uses a **Linear Dump (Virtual Dump)** strategy. It maps the file on disk exactly as it appears in memory (Virtual Address == Raw Offset). This is highly effective for dumping packed or obfuscated modules (e.g., Themida, VMProtect).
+### Memory Dumping
 
-**Note:** The output file will have `FileAlignment` set to match `SectionAlignment`. Tools like IDA Pro load this perfectly, but the raw file on disk will be larger due to memory alignment.
+**`DumpMemory` / `DumpMemoryEx`:**
+
+`DumpMemory` reads from the attached target process. `DumpMemoryEx` takes an explicit PID, which is required when reading kernel-space addresses (e.g. `win32k.sys`, `win32kbase.sys`) — pass the PID ORed with `VMMDLL_PID_PROCESS_WITH_KERNELMEMORY`.
 
 ```cpp
-if (g_Dma.DumpModule("unityplayer.dll", "C:\\Dumps\\unityplayer_dump.dll")) {
+// Standard process memory dump
+std::vector<uint8_t> buf = dma.DumpMemory(address, size);
+
+// Kernel module dump (must use explicit kernel-context PID)
+std::vector<uint8_t> kbuf = dma.DumpMemoryEx(
+    csrss_pid | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY,
+    win32k_base, win32k_size);
+```
+
+**`DumpModule` (Linear Dump to disk):**
+
+Reconstructs a full module from memory to disk. Uses a **Linear Dump** strategy where Virtual Address == Raw Offset, which bypasses packers that manipulate section headers (e.g. VMProtect, Themida). The output loads correctly in IDA Pro.
+
+```cpp
+if (dma.DumpModule("unityplayer.dll", "C:\\Dumps\\unityplayer_dump.dll")) {
     std::cout << "[+] Module dumped successfully!" << std::endl;
 }
 ```
 
+> **Note:** `FileAlignment` is set to match `SectionAlignment` in the output, so the file on disk will be larger than the original due to memory alignment padding.
+
 ### Keyboard & Mouse Support
-Teeko-DMA-Lib includes built-in support for reading keyboard state and global cursor coordinates directly from kernel memory (via `win32kbase.sys`), allowing for low-latency detection without standard Windows APIs.
+
+Reads keyboard state and cursor position directly from `win32kbase.sys` kernel memory, bypassing standard Windows APIs. Supports both Win10 (EAT/PDB lookup) and Win11 (csrss session sig-scan) automatically.
 
 ```cpp
-// 1. Initialize Keyboard (starts a background polling thread)
-// This will automatically parse PDB data/EAT data for exports needed to read from win32kbase.sys
-if (g_Dma.InitKeyboard(10)) { // Poll every 10ms
+// Initialize keyboard — starts a background polling thread
+// arg 1: poll interval in milliseconds
+// arg 2: bool debug — prints verbose diagnostic output to console
+if (dma.InitKeyboard(10, false)) {
     std::cout << "[+] Keyboard initialized" << std::endl;
 }
 
-// 2. Check Key State
-if (g_Dma.IsKeyDown('A')) {
-    std::cout << "A key is held down" << std::endl;
-}
+// Key state queries
+if (dma.IsKeyDown('A'))         std::cout << "A is held" << std::endl;
+if (dma.IsKeyPressed(VK_SPACE)) std::cout << "Space just pressed" << std::endl;
+if (dma.IsKeyReleased('D'))     std::cout << "D just released" << std::endl;
 
-if (g_Dma.IsKeyPressed(VK_SPACE)) {
-    std::cout << "Space bar was just pressed (rising edge)" << std::endl;
-}
+// Cursor position (requires InitKeyboard to have run first)
+POINT pt = dma.GetCursorPosition();
+std::cout << "Cursor: " << pt.x << ", " << pt.y << std::endl;
+```
 
-// 3. Read Mouse State
-POINT pt = g_Dma.GetCursorPosition();
-std::cout << "Cursor X: " << pt.x << ", Y: " << pt.y << std::endl;
+**Debugging `InitKeyboard`:**
+
+Pass `true` as the second argument to get a full diagnostic trace. This prints every step — build string parsing, which code path is taken (Win10 EAT vs Win11 sig-scan), csrss candidates found, module bases, dump results, signature hit addresses, and the final resolved `gafAsyncKeyState` VA.
+
+```cpp
+dma.InitKeyboard(10, true);
+```
+
+```
+[InitKeyboard] Raw build string: "26200"
+[InitKeyboard] Winver=26200 (threshold 22000, path=Win11/csrss sig-scan)
+[InitKeyboard] winlogon.exe pid=1832
+[InitKeyboard] Found csrss candidate: pid=1544 path="C:\WINDOWS\system32\csrss.exe"
+[InitKeyboard] [pid=1544] win32ksgd.sys not found, trying win32k.sys
+[InitKeyboard] [pid=1544] win32k.sys base=0xfffff8021b1b0000 size=0xc6000
+[InitKeyboard] [pid=1544] Dumped win32k, bytes=811008
+...
 ```
