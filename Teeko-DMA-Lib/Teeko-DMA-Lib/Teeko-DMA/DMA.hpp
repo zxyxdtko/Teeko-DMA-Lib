@@ -15,9 +15,36 @@
 #pragma comment(lib, "vmm.lib")
 #pragma comment(lib, "leechcore.lib")
 
+// Standard XInput Button Bitmasks
+#define XINPUT_GAMEPAD_DPAD_UP          0x0001
+#define XINPUT_GAMEPAD_DPAD_DOWN        0x0002
+#define XINPUT_GAMEPAD_DPAD_LEFT        0x0004
+#define XINPUT_GAMEPAD_DPAD_RIGHT       0x0008
+#define XINPUT_GAMEPAD_START            0x0010
+#define XINPUT_GAMEPAD_BACK             0x0020
+#define XINPUT_GAMEPAD_LEFT_THUMB       0x0040 // Left stick click
+#define XINPUT_GAMEPAD_RIGHT_THUMB      0x0080 // Right stick click
+#define XINPUT_GAMEPAD_LEFT_SHOULDER    0x0100 // LB
+#define XINPUT_GAMEPAD_RIGHT_SHOULDER   0x0200 // RB
+#define XINPUT_GAMEPAD_A                0x1000
+#define XINPUT_GAMEPAD_B                0x2000
+#define XINPUT_GAMEPAD_X                0x4000
+#define XINPUT_GAMEPAD_Y                0x8000
+
 struct HeapRegion {
     uint64_t start;
     uint64_t end;
+};
+
+// --- Gamepad State ---
+struct GamepadState {
+    uint16_t buttons;
+    uint8_t leftTrigger;
+    uint8_t rightTrigger;
+    int16_t thumbLX;
+    int16_t thumbLY;
+    int16_t thumbRX;
+    int16_t thumbRY;
 };
 
 class _DMA {
@@ -68,6 +95,12 @@ private:
     uint8_t pressed_bitmap[64] = { 0 };
     uint8_t released_bitmap[64] = { 0 };
 
+    uint64_t active_controller_address = 0;
+    GamepadState currentGamepadState = { 0 };
+    std::atomic<bool> gamepad_running = false;
+    std::thread gamepad_thread;
+    std::mutex gamepad_mutex;
+
     inline void KeyboardThread(int poll_ms = 10) {
         while (kb_running.load()) {
             if (hVMM && gafAsyncKeyStateExport) {
@@ -105,6 +138,69 @@ private:
         kb_running = false;
         if (kb_thread.joinable())
             kb_thread.join();
+    }
+
+    inline void StopGamepadThread() {
+        gamepad_running = false;
+        if (gamepad_thread.joinable())
+            gamepad_thread.join();
+    }
+
+    inline void GamepadThread(int poll_ms = 4) {
+        DWORD sysPid = 4 | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY;
+
+        while (gamepad_running.load()) {
+            if (hVMM && active_controller_address) {
+                // Read a 16-byte chunk starting at 0x1CEC. 
+                // We only need up to idx 14 (0x0E) to get all inputs!
+                uint8_t buffer[16] = { 0 };
+                DWORD br = 0;
+
+                if (VMMDLL_MemReadEx(hVMM, sysPid, active_controller_address + 0x1CEC,
+                    buffer, sizeof(buffer), &br, VMMDLL_FLAG_NOCACHE)) {
+
+                    uint16_t xinput_buttons = 0;
+                    uint8_t b1 = buffer[1];
+                    uint8_t b2 = buffer[2];
+
+                    // --- Translate Byte 1 (Face Buttons & System) ---
+                    if (b1 & 0x04) xinput_buttons |= XINPUT_GAMEPAD_START;
+                    if (b1 & 0x08) xinput_buttons |= XINPUT_GAMEPAD_BACK;
+                    if (b1 & 0x10) xinput_buttons |= XINPUT_GAMEPAD_A;
+                    if (b1 & 0x20) xinput_buttons |= XINPUT_GAMEPAD_B;
+                    if (b1 & 0x40) xinput_buttons |= XINPUT_GAMEPAD_X;
+                    if (b1 & 0x80) xinput_buttons |= XINPUT_GAMEPAD_Y;
+
+                    // --- Translate Byte 2 (D-Pad & Bumpers & Clicks) ---
+                    if (b2 & 0x01) xinput_buttons |= XINPUT_GAMEPAD_DPAD_UP;
+                    if (b2 & 0x02) xinput_buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
+                    if (b2 & 0x04) xinput_buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
+                    if (b2 & 0x08) xinput_buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+                    if (b2 & 0x10) xinput_buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+                    if (b2 & 0x20) xinput_buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+                    if (b2 & 0x40) xinput_buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
+                    if (b2 & 0x80) xinput_buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+
+                    // --- Translate 10-bit Triggers to 8-bit (0-255) ---
+                    // Read 2 bytes, mask off garbage bits, and divide by 4 (shift right by 2)
+                    uint16_t rawLT = *reinterpret_cast<uint16_t*>(&buffer[3]) & 0x03FF;
+                    uint16_t rawRT = *reinterpret_cast<uint16_t*>(&buffer[5]) & 0x03FF;
+
+                    std::lock_guard<std::mutex> lock(gamepad_mutex);
+
+                    currentGamepadState.buttons = xinput_buttons;
+                    currentGamepadState.leftTrigger = static_cast<uint8_t>(rawLT / 4);
+                    currentGamepadState.rightTrigger = static_cast<uint8_t>(rawRT / 4);
+
+                    // --- Map the 16-bit Thumbsticks ---
+                    currentGamepadState.thumbLX = *reinterpret_cast<int16_t*>(&buffer[7]);
+                    currentGamepadState.thumbLY = *reinterpret_cast<int16_t*>(&buffer[9]);
+                    currentGamepadState.thumbRX = *reinterpret_cast<int16_t*>(&buffer[11]);
+                    currentGamepadState.thumbRY = *reinterpret_cast<int16_t*>(&buffer[13]);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        }
     }
 
     inline std::vector<PatternByte> ParseSignature(const std::string& signature) {
@@ -1165,6 +1261,83 @@ public:
     }
 
     /// <summary>
+    /// Initializes the Xbox Gamepad reader by locating xboxgip.sys, scanning for the 
+    /// static context array, and finding the active controller slot.
+    /// </summary>
+    inline bool InitGamepad(int poll_ms = 4, bool debug = false) {
+        if (!hVMM) return false;
+
+        DWORD sysPid = 4 | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY;
+
+        PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
+        if (!VMMDLL_Map_GetModuleFromNameU(hVMM, sysPid, "xboxgip.sys", &pModuleEntry, 0)) {
+            if (debug) printf("[InitGamepad] FAIL: Could not find xboxgip.sys\n");
+            return false;
+        }
+
+        uint64_t base = pModuleEntry->vaBase;
+        uint32_t size = pModuleEntry->cbImageSize;
+        VMMDLL_MemFree(pModuleEntry);
+
+        std::vector<uint8_t> moduleDump = DumpMemoryEx(sysPid, base, size);
+        if (moduleDump.empty()) return false;
+
+        // Signature #2: 48 8D 05 ? ? ? ? 33 D2 
+        auto pattern = ParseSignature("48 8D 05 ? ? ? ? 33 D2");
+        uint64_t hitAddress = ScanLocalBuffer(moduleDump, base, pattern);
+
+        if (!hitAddress) {
+            if (debug) printf("[InitGamepad] FAIL: Signature not found.\n");
+            return false;
+        }
+
+        // Resolve RIP-relative offset from local buffer
+        int32_t relativeOffset = *reinterpret_cast<int32_t*>(&moduleDump[hitAddress - base + 3]);
+        uint64_t arrayStart = hitAddress + 7 + relativeOffset;
+
+        // Find the active slot
+        for (int i = 0; i < 8; i++) {
+            uint64_t slotAddress = arrayStart + (i * 8056);
+
+            uint8_t isActive = 0;
+            DWORD br = 0;
+            if (!VMMDLL_MemReadEx(hVMM, sysPid, slotAddress + 0x140, &isActive, 1, &br, VMMDLL_FLAG_NOCACHE)) {
+                continue;
+            }
+
+            if (isActive == 1) {
+                if (debug) printf("[InitGamepad] SUCCESS: Found active controller at 0x%llx\n", slotAddress);
+                active_controller_address = slotAddress;
+
+                // Start the background thread
+                gamepad_running = true;
+                gamepad_thread = std::thread(&_DMA::GamepadThread, this, poll_ms);
+                return true;
+            }
+        }
+
+        if (debug) printf("[InitGamepad] FAIL: No active controllers found.\n");
+        return false;
+    }
+
+    /// <summary>
+    /// Returns a thread-safe copy of the current Gamepad State.
+    /// </summary>
+    inline GamepadState GetGamepadState() {
+        std::lock_guard<std::mutex> lock(gamepad_mutex);
+        return currentGamepadState;
+    }
+
+    /// <summary>
+    /// Checks if a specific XInput button bitmask is currently pressed.
+    /// Example: dma.IsGamepadButtonPressed(0x1000) // Checks 'A' button
+    /// </summary>
+    inline bool IsGamepadButtonPressed(uint16_t buttonMask) {
+        std::lock_guard<std::mutex> lock(gamepad_mutex);
+        return (currentGamepadState.buttons & buttonMask) != 0;
+    }
+
+    /// <summary>
     /// Check if a key is currently held down.
     /// </summary>
     /// <param name="vk">Virtual Key code to check.</param>
@@ -1300,4 +1473,71 @@ public:
         if (debug) printf("[CursorPos] OK: x=%ld y=%ld\n", pt.x, pt.y);
         return pt;
     }
-};
+
+    /// <summary>
+        /// Locates the xboxgip.sys static array (caches it), finds the active controller slot, 
+        /// and returns the live 24-byte hardware state buffer for real-time diffing.
+        /// </summary>
+    inline std::vector<uint8_t> GetLiveGamepadBuffer(bool debug = false) {
+        std::vector<uint8_t> buffer(24, 0); // 24-byte array initialized to 0
+        if (!hVMM) return buffer;
+
+        DWORD sysPid = 4 | VMMDLL_PID_PROCESS_WITH_KERNELMEMORY;
+
+        // 1. Check if we already found the controller. If not, do the heavy sig-scan.
+        if (active_controller_address == 0) {
+            PVMMDLL_MAP_MODULEENTRY pModuleEntry = nullptr;
+            if (!VMMDLL_Map_GetModuleFromNameU(hVMM, sysPid, "xboxgip.sys", &pModuleEntry, 0)) {
+                if (debug) printf("[GamepadDump] FAIL: Could not find xboxgip.sys\n");
+                return buffer;
+            }
+
+            uint64_t base = pModuleEntry->vaBase;
+            uint32_t size = pModuleEntry->cbImageSize;
+            VMMDLL_MemFree(pModuleEntry);
+
+            std::vector<uint8_t> moduleDump = DumpMemoryEx(sysPid, base, size);
+            if (moduleDump.empty()) return buffer;
+
+            auto pattern = ParseSignature("48 8D 05 ? ? ? ? 33 D2");
+            uint64_t hitAddress = ScanLocalBuffer(moduleDump, base, pattern);
+
+            if (!hitAddress) {
+                if (debug) printf("[GamepadDump] FAIL: Signature not found.\n");
+                return buffer;
+            }
+
+            int32_t relativeOffset = *reinterpret_cast<int32_t*>(&moduleDump[hitAddress - base + 3]);
+            uint64_t arrayStart = hitAddress + 7 + relativeOffset;
+
+            if (debug) printf("[GamepadDump] Array Base resolved to: 0x%llx\n", arrayStart);
+
+            for (int i = 0; i < 8; i++) {
+                uint64_t slotAddress = arrayStart + (i * 8056);
+
+                uint8_t isActive = 0;
+                DWORD br = 0;
+                if (!VMMDLL_MemReadEx(hVMM, sysPid, slotAddress + 0x140, &isActive, 1, &br, VMMDLL_FLAG_NOCACHE)) {
+                    continue;
+                }
+
+                if (isActive == 1) {
+                    if (debug) printf("[GamepadDump] Found active controller at slot %d (0x%llx)\n", i, slotAddress);
+                    // Cache the address so we never have to sig-scan again!
+                    active_controller_address = slotAddress;
+                    break;
+                }
+            }
+        }
+
+        // 2. We have the address! Read the 24 bytes starting at the button offset.
+        if (active_controller_address != 0) {
+            DWORD br = 0;
+            VMMDLL_MemReadEx(hVMM, sysPid, active_controller_address + 0x1CEC, buffer.data(), 24, &br, VMMDLL_FLAG_NOCACHE);
+        }
+        else {
+            if (debug) printf("[GamepadDump] FAIL: No active controllers found in slots 0-7.\n");
+        }
+
+        return buffer;
+    }};

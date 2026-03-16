@@ -15,6 +15,7 @@ A lightweight, header-only C++ DMA (Direct Memory Access) library wrapper around
 - **Anti-Cheat Bypass Helpers**: `IsCR3Valid`, `SetCR3`, and `ClearCache`.
 - **Module Dumping**: `DumpModule` reconstructs modules from memory to disk using a **Linear Dump** strategy (fixes Section Headers and IAT).
 - **Keyboard & Mouse Support**: Reads global keyboard state (`IsKeyDown`, `IsKeyPressed`, `IsKeyReleased`) and cursor coordinates (`GetCursorPosition`) directly from `win32kbase.sys`, with built-in debug logging.
+- **Xbox Gamepad Support**: Reads raw physical memory from the Game Input Protocol driver (`xboxgip.sys`), completely bypassing user-mode APIs, and translates the raw hardware payload into standard XInput formats on the fly.
 
 ## Prerequisites
 
@@ -141,8 +142,6 @@ if (dma.DumpModule("unityplayer.dll", "C:\\Dumps\\unityplayer_dump.dll")) {
 }
 ```
 
-> **Note:** `FileAlignment` is set to match `SectionAlignment` in the output, so the file on disk will be larger than the original due to memory alignment padding.
-
 ### Keyboard & Mouse Support
 
 Reads keyboard state and cursor position directly from `win32kbase.sys` kernel memory, bypassing standard Windows APIs. Supports both Win10 (EAT/PDB lookup) and Win11 (csrss session sig-scan) automatically.
@@ -165,21 +164,30 @@ POINT pt = dma.GetCursorPosition();
 std::cout << "Cursor: " << pt.x << ", " << pt.y << std::endl;
 ```
 
-**Debugging `InitKeyboard`:**
+### Xbox Gamepad Support
 
-Pass `true` as the second argument to get a full diagnostic trace. This prints every step — build string parsing, which code path is taken (Win10 EAT vs Win11 sig-scan), csrss candidates found, module bases, dump results, signature hit addresses, and the final resolved `gafAsyncKeyState` VA.
+Reads raw physical memory from the Game Input Protocol driver (`xboxgip.sys`), completely bypassing user-mode APIs like `xinput1_4.dll` and `gameinputsvc.exe`. The library handles the reverse-engineered layout and automatically translates the raw 10-bit hardware payload into standard XInput formats for perfect compatibility.
 
 ```cpp
-dma.InitKeyboard(10, true);
-```
+// Initialize gamepad — locates the driver, scans for the active controller slot,
+// and spins up a background polling thread.
+// arg 1: poll interval in milliseconds (4ms is standard for Xbox controllers)
+// arg 2: bool debug — prints signature scanning diagnostics
+if (dma.InitGamepad(4, false)) {
+    std::cout << "[+] Gamepad initialized" << std::endl;
+}
 
-```
-[InitKeyboard] Raw build string: "26200"
-[InitKeyboard] Winver=26200 (threshold 22000, path=Win11/csrss sig-scan)
-[InitKeyboard] winlogon.exe pid=1832
-[InitKeyboard] Found csrss candidate: pid=1544 path="C:\WINDOWS\system32\csrss.exe"
-[InitKeyboard] [pid=1544] win32ksgd.sys not found, trying win32k.sys
-[InitKeyboard] [pid=1544] win32k.sys base=0xfffff8021b1b0000 size=0xc6000
-[InitKeyboard] [pid=1544] Dumped win32k, bytes=811008
-...
+// Check standard XInput discrete buttons
+if (dma.IsGamepadButtonPressed(XINPUT_GAMEPAD_A)) {
+    std::cout << "A button pressed!" << std::endl;
+}
+
+if (dma.IsGamepadButtonPressed(XINPUT_GAMEPAD_DPAD_UP)) {
+    std::cout << "D-Pad Up pressed!" << std::endl;
+}
+
+// Fetch the full analog state (Triggers are scaled 0-255, sticks are -32768 to 32767)
+GamepadState state = dma.GetGamepadState();
+std::cout << "Left Trigger: " << (int)state.leftTrigger << std::endl;
+std::cout << "Right Stick X: " << state.thumbRX << std::endl;
 ```
