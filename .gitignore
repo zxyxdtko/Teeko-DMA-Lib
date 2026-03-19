@@ -365,8 +365,3 @@ MigrationBackup/
 
 # CMake
 out/
-
-SerenityV2/build/
-SerenityV2/Intermediate/
-SerenityV2/x64/
-SerenityV2/build/

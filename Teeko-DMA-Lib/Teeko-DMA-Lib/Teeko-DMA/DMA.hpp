@@ -71,11 +71,12 @@ private:
     struct SigScanRequest {
         std::string name;
         std::string signature;
+        bool wantsAll = false;
     };
 
-    std::unordered_map<std::string, std::vector<SigScanRequest>>
-        queuedModuleScans;
+    std::unordered_map<std::string, std::vector<SigScanRequest>> queuedModuleScans;
     std::unordered_map<std::string, uint64_t> scanResults;
+    std::unordered_map<std::string, std::vector<uint64_t>> scanResultsMulti;
 
     struct HeapProfile {
         bool fPrivateMemory = false;
@@ -244,6 +245,32 @@ private:
                 return baseAddress + i;
         }
         return 0;
+    }
+
+    inline std::vector<uint64_t> ScanAllLocalBuffer(
+        const std::vector<uint8_t>& buffer,
+        uint64_t baseAddress,
+        const std::vector<PatternByte>& pattern)
+    {
+        std::vector<uint64_t> results;
+        if (pattern.empty() || buffer.size() < pattern.size())
+            return results;
+
+        for (size_t i = 0; i <= buffer.size() - pattern.size(); ++i)
+        {
+            bool found = true;
+            for (size_t j = 0; j < pattern.size(); ++j)
+            {
+                if (!pattern[j].ignore && buffer[i + j] != pattern[j].value)
+                {
+                    found = false;
+                    break;
+                }
+            }
+            if (found)
+                results.push_back(baseAddress + i);
+        }
+        return results;
     }
 
     inline bool CacheModule(const std::string& moduleName) {
@@ -700,6 +727,13 @@ public:
         queuedModuleScans[moduleName].push_back({ scanName, signature });
     }
 
+    /// <summary>Queue a multi-result signature scan. Use GetScanResultAll() to retrieve.</summary>
+    inline void QueueModuleScanAll(const std::string& moduleName,
+        const std::string& scanName,
+        const std::string& signature) {
+        queuedModuleScans[moduleName].push_back({ scanName, signature, true });
+    }
+
     /// <summary>Execute all queued module scans.</summary>
     inline void ExecuteModuleScans() {
         for (const auto& [modName, requests] : queuedModuleScans) {
@@ -715,7 +749,10 @@ public:
 
             for (const auto& req : requests) {
                 std::vector<PatternByte> pattern = ParseSignature(req.signature);
-                scanResults[req.name] = ScanLocalBuffer(localDump, modBase, pattern);
+                if (req.wantsAll)
+                    scanResultsMulti[req.name] = ScanAllLocalBuffer(localDump, modBase, pattern);
+                else
+                    scanResults[req.name] = ScanLocalBuffer(localDump, modBase, pattern);
             }
         }
         queuedModuleScans.clear();
@@ -727,6 +764,14 @@ public:
             return scanResults[scanName];
         }
         return 0;
+    }
+
+    /// <summary>Retrieve all results from a previous multi-result scan.</summary>
+    inline std::vector<uint64_t> GetScanResultAll(const std::string& scanName) {
+        auto it = scanResultsMulti.find(scanName);
+        if (it != scanResultsMulti.end())
+            return it->second;
+        return {};
     }
 
     /// <summary>
@@ -1540,4 +1585,5 @@ public:
         }
 
         return buffer;
-    }};
+    }
+};
