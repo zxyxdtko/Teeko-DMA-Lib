@@ -1,0 +1,59 @@
+name: Cross-platform tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: >-
+          cmake -S . -B build -A x64
+          -DSTRATA_DMA_BUILD_EXAMPLE=OFF
+          -DSTRATA_DMA_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --config ${{ matrix.configuration }} --parallel
+      - name: Test
+        run: >-
+          ctest --test-dir build
+          -C ${{ matrix.configuration }}
+          --output-on-failure
+
+  fedora:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    env:
+      STRATA_DMA_RUNTIME_DIR: /tmp/memprocfs-runtime
+      MEMPROCFS_LINUX_URL: >-
+        https://github.com/ufrisk/MemProcFS/releases/download/v5.16/MemProcFS_files_and_binaries_v5.16.14-linux_x64-20260211.tar.gz
+      MEMPROCFS_LINUX_SHA256: bc7ea472af63894b15ff6ebc93d62cdf35d3e802e9db157598fef79a4737af0b
+    steps:
+      - name: Install Fedora build dependencies
+        run: dnf install -y cmake curl gcc-c++ git gzip libusb1 ninja-build tar
+      - uses: actions/checkout@v5
+      - name: Install matching MemProcFS build runtime
+        shell: bash
+        run: |
+          mkdir -p "$STRATA_DMA_RUNTIME_DIR"
+          curl --fail --location --silent --show-error \
+            "$MEMPROCFS_LINUX_URL" --output /tmp/memprocfs-runtime.tar.gz
+          echo "$MEMPROCFS_LINUX_SHA256  /tmp/memprocfs-runtime.tar.gz" | sha256sum --check
+          tar -xzf /tmp/memprocfs-runtime.tar.gz -C "$STRATA_DMA_RUNTIME_DIR"
+          test -f "$STRATA_DMA_RUNTIME_DIR/vmm.so"
+          test -f "$STRATA_DMA_RUNTIME_DIR/leechcore.so"
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DSTRATA_DMA_BUILD_EXAMPLE=OFF
+          -DSTRATA_DMA_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

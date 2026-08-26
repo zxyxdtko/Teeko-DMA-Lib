@@ -1,0 +1,32 @@
+# Third-party notices
+
+StrataDMA is Copyright (C) 2026 choz-dev and contributors and is distributed
+under the GNU Affero General Public License version 3. See `LICENSE`.
+
+The repository includes the following third-party components. They remain
+copyrighted by their respective authors and are distributed under their own
+licenses.
+
+## MemProcFS / VMMDLL
+
+- Copyright: Ulf Frisk and MemProcFS contributors
+- Upstream: <https://github.com/ufrisk/MemProcFS>
+- License: GNU Affero General Public License version 3
+- Vendored version: VMMDLL header 5.16.5
+- Included files: `vmmdll.h`, `vmm.lib`, and `info.db`
+
+The complete corresponding source and license are available from the upstream
+repository. Preserve its copyright and license notices when redistributing
+these files or binaries linked against them.
+
+## LeechCore
+
+- Copyright: Ulf Frisk and LeechCore contributors
+- Upstream: <https://github.com/ufrisk/LeechCore>
+- License: GNU General Public License version 3
+- Vendored version: LeechCore header 2.17
+- Included files: `leechcore.h` and `leechcore.lib`
+
+The complete corresponding source and license are available from the upstream
+repository. Preserve its copyright and license notices when redistributing
+these files or binaries linked against them.
